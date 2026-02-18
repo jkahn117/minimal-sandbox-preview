@@ -1,0 +1,20 @@
+---
+// This page is handled by the Worker
+// The Worker returns HTML with an iframe pointing to the sandbox preview
+---
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sandbox SDK Example</title>
+</head>
+<body>
+  <p>Loading sandbox...</p>
+  <script>
+    // Trigger Worker initialization by fetching root
+    window.location.href = '/';
+  </script>
+</body>
+</html>
