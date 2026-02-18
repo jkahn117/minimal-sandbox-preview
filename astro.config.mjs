@@ -1,20 +1,23 @@
-import { defineConfig } from 'astro/config';
-import cloudflare from '@astrojs/cloudflare';
+import { defineConfig } from "astro/config";
+import cloudflare from "@astrojs/cloudflare";
 
 export default defineConfig({
-  output: 'server',
+  output: "server",
   adapter: cloudflare({
     runtime: {
-      mode: 'local'
-    }
+      mode: "local",
+    },
+    platformProxy: {
+      enabled: true,
+    },
   }),
   vite: {
     build: {
       rollupOptions: {
         input: {
-          worker: './src/worker/index.ts'
-        }
-      }
-    }
-  }
+          worker: "./src/worker/index.ts",
+        },
+      },
+    },
+  },
 });

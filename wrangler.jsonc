@@ -2,11 +2,16 @@
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "sandbox-minimal-example",
   "main": "./src/worker/index.ts",
-  "compatibility_date": "2025-02-18",
+  "compatibility_date": "2026-02-18",
   "compatibility_flags": ["nodejs_compat"],
+
+  "observability": {
+    "enabled": true,
+  },
 
   "containers": [
     {
+      "name": "sandbox",
       "class_name": "Sandbox",
       "image": "./sandbox/Dockerfile",
       "instance_type": "lite",
@@ -30,12 +35,41 @@
     },
   ],
 
-  "routes": [
-    {
-      "pattern": "*.sandbox.cfsa.dev",
-      "zone_name": "cfsa.dev",
-    },
-  ],
+  "env": {
+    "production": {
+      "main": "./src/worker/index.ts",
 
-  "workers_dev": false,
+      "containers": [
+        {
+          "name": "sandbox",
+          "class_name": "Sandbox",
+          "image": "./sandbox/Dockerfile",
+          "instance_type": "lite",
+          "max_instances": 1,
+        },
+      ],
+
+      "durable_objects": {
+        "bindings": [
+          {
+            "class_name": "Sandbox",
+            "name": "Sandbox",
+          },
+        ],
+      },
+
+      "routes": [
+        {
+          "pattern": "sandbox.cfsa.dev",
+          "custom_domain": true,
+        },
+        {
+          "pattern": "*.sandbox.cfsa.dev",
+          "zone_name": "cfsa.dev",
+        },
+      ],
+
+      "workers_dev": false,
+    },
+  },
 }
