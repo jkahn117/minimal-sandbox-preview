@@ -2,13 +2,14 @@
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "sandbox-minimal-example",
   "main": "./src/worker-entry.ts",
-  "compatibility_date": "2026-02-18",
+  "compatibility_date": "2026-02-19",
+  // fetch_iterable_type_support: workaround for Astro returning AsyncIterable
+  // response bodies when nodejs_compat is enabled. Auto-enables at compat date
+  // 2026-02-19. See https://github.com/withastro/astro/issues/14511
   "compatibility_flags": ["nodejs_compat"],
-
   "observability": {
     "enabled": true,
   },
-
   // Container config at top level so local dev can access it
   "containers": [
     {
@@ -19,7 +20,6 @@
       "max_instances": 1,
     },
   ],
-
   // Durable Objects binding
   "durable_objects": {
     "bindings": [
@@ -29,51 +29,27 @@
       },
     ],
   },
-
   "migrations": [
     {
       "tag": "v1",
       "new_sqlite_classes": ["Sandbox"],
     },
   ],
-
   "services": [
     {
       "binding": "MY_WORKER",
       "service": "sandbox-minimal-example",
     },
   ],
-
-  "env": {
-    "production": {
-      "durable_objects": {
-        "bindings": [
-          {
-            "class_name": "Sandbox",
-            "name": "Sandbox",
-          },
-        ],
-      },
-
-      "routes": [
-        {
-          "pattern": "sandbox.cfsa.dev",
-          "custom_domain": true,
-        },
-        {
-          "pattern": "*.sandbox.cfsa.dev",
-          "zone_name": "cfsa.dev",
-        },
-      ],
-
-      "services": [
-        {
-          "binding": "MY_WORKER",
-          "service": "sandbox-minimal-example",
-        },
-      ],
-
-      "workers_dev": false,
+  "routes": [
+    {
+      "pattern": "sandbox.cfsa.dev",
+      "custom_domain": true,
     },
-  },
+    {
+      "pattern": "*.sandbox.cfsa.dev",
+      "zone_name": "cfsa.dev",
+    },
+  ],
+  "workers_dev": false,
 }

@@ -91,9 +91,8 @@ app.listen(PORT, '0.0.0.0', () => {
       `.trim(),
     );
 
-    broadcast({ type: "progress", step: "installing_dependencies" });
-    currentStep = "installing_dependencies";
-    await sandbox.exec("npm install", { cwd: "/workspace" });
+    // Skip npm install — the Dockerfile pre-installs deps via pnpm.
+    // Running npm install at runtime is redundant and reports "Success: false".
 
     broadcast({ type: "progress", step: "starting_server" });
     currentStep = "starting_server";
@@ -125,13 +124,30 @@ app.listen(PORT, '0.0.0.0', () => {
 
     broadcast({ type: "progress", step: "exposing_port" });
     currentStep = "exposing_port";
-    const exposed = await sandbox.exposePort(3001, {
-      hostname: host,
-      name: "express-server",
-      token: "express",
-    });
 
-    previewUrl = exposed.url;
+    let exposedUrl: string;
+    try {
+      const exposed = await sandbox.exposePort(3001, {
+        hostname: host,
+        name: "express-server",
+        token: "express",
+      });
+      exposedUrl = exposed.url;
+    } catch (exposeErr: unknown) {
+      // Port persists across deploys — if already exposed, retrieve the
+      // existing preview URL via getHost()
+      const msg =
+        exposeErr instanceof Error ? exposeErr.message : String(exposeErr);
+      if (msg.includes("PortAlreadyExposedError")) {
+        console.log("[sandbox] Port already exposed, retrieving existing URL");
+        const existingHost = await sandbox.getHost(3001);
+        exposedUrl = `https://${existingHost}`;
+      } else {
+        throw exposeErr;
+      }
+    }
+
+    previewUrl = exposedUrl;
     isInitialized = true;
     isInitializing = false;
     currentStep = "ready";

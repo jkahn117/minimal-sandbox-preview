@@ -16,11 +16,18 @@ export const onRequest = defineMiddleware(async ({ request }, next) => {
   const { Sandbox } = env as Env;
 
   if (Sandbox) {
-    const { proxyToSandbox } = await import("@cloudflare/sandbox");
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const proxyResponse = await proxyToSandbox(request, env as any);
-    if (proxyResponse) {
-      return proxyResponse;
+    try {
+      const { proxyToSandbox } = await import("@cloudflare/sandbox");
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const proxyResponse = await proxyToSandbox(request, env as any);
+      // Only return if it's an actual Response — proxyToSandbox can return
+      // truthy non-Response objects (e.g. proxy stubs) which Astro would
+      // serialize as "[object Object]".
+      if (proxyResponse instanceof Response) {
+        return proxyResponse;
+      }
+    } catch (err) {
+      console.error("[middleware] proxyToSandbox error:", err);
     }
   }
 
