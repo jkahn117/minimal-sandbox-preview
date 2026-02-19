@@ -68,11 +68,13 @@ const { sandboxId, host } = Astro.props;
 
 <script>
   /**
-   * Astro's bundled <script> — only place where `astro:actions` imports work.
-   * Sets up Alpine.js data component and wires up the async init logic.
+   * Thin Alpine.js binding layer. All WS/polling logic lives in
+   * SandboxPreview (src/lib/sandbox-preview.ts). This script just
+   * wires the library's events to Alpine's reactive state.
    */
   import Alpine from "alpinejs";
   import { actions } from "astro:actions";
+  import { SandboxPreview, type ActionResult } from "../lib/sandbox-preview";
 
   const STEP_DESCRIPTIONS: Record<string, string> = {
     creating_workspace: "Creating workspace...",
@@ -82,188 +84,58 @@ const { sandboxId, host } = Astro.props;
     exposing_port: "Configuring preview URL...",
   };
 
-  /** Grace period before polling activates (gives WS time to deliver). */
-  const POLL_FALLBACK_DELAY = 5_000;
-  /** Polling interval — intentionally slow since this is a backup. */
-  const POLL_INTERVAL = 5_000;
-
-  // Read data attributes from the container element before Alpine.data
-  // runs, avoiding reliance on Alpine's `$el` magic property (which the
-  // Astro TS checker can't resolve).
   const containerEl = document.querySelector<HTMLElement>(".sandbox-container");
-  const pageSandboxId = containerEl?.dataset.sandboxId ?? "";
-  const pageHost = containerEl?.dataset.host ?? window.location.host;
+  const sandboxId = containerEl?.dataset.sandboxId ?? "";
+  const host = containerEl?.dataset.host ?? window.location.host;
+
+  /** Adapt Astro Actions' result shape to what SandboxPreview expects. */
+  const callAction = async (): Promise<ActionResult> => {
+    const result = await actions.startSandbox({ sandboxId, host });
+    if (result.error) {
+      return { error: { message: result.error.message } };
+    }
+    // Widen the discriminated union — the library only needs status +
+    // optional previewUrl/wsEndpoint/message fields.
+    const data = result.data as ActionResult["data"];
+    return { data };
+  };
 
   Alpine.data("sandbox", () => ({
-    // --- Reactive UI state ---
     state: "loading" as "loading" | "ready" | "error",
     statusText: "Initializing...",
     stepKey: "",
     previewUrl: "",
     errorMessage: "",
 
-    // --- Internal (non-reactive) bookkeeping ---
-    _pollTimer: null as ReturnType<typeof setInterval> | null,
-    _pollFallbackTimer: null as ReturnType<typeof setTimeout> | null,
-    _ws: null as WebSocket | null,
-    _settled: false,
-    _wsHasDelivered: false,
+    _preview: null as SandboxPreview | null,
 
     init() {
-      this._start();
+      const preview = new SandboxPreview({
+        start: callAction,
+        poll: callAction,
+      });
+
+      preview.on("progress", ({ step }) => {
+        this.statusText = STEP_DESCRIPTIONS[step] ?? "Initializing...";
+        this.stepKey = step;
+      });
+
+      preview.on("ready", ({ previewUrl }) => {
+        this.state = "ready";
+        this.previewUrl = previewUrl;
+      });
+
+      preview.on("error", ({ message }) => {
+        this.state = "error";
+        this.errorMessage = message;
+      });
+
+      this._preview = preview;
+      preview.init();
     },
 
-    async _start() {
-      const sandboxId = pageSandboxId;
-      const host = pageHost;
-
-      try {
-        this.statusText = "Starting sandbox...";
-
-        const result = await actions.startSandbox({ sandboxId, host });
-
-        if (result.error) {
-          this._showError(result.error.message ?? "Failed to start sandbox");
-          return;
-        }
-
-        const { data } = result;
-
-        // Already ready (e.g. page refresh while container still alive)
-        if (data.status === "ready" && data.previewUrl) {
-          this._showReady(data.previewUrl);
-          return;
-        }
-
-        // Connect WebSocket — primary channel for progress updates
-        const wsEndpoint = data.wsEndpoint || `/api/ws?sandboxId=${sandboxId}`;
-        this._connectWebSocket(wsEndpoint, sandboxId, host);
-
-        // Schedule deferred polling fallback
-        this._schedulePollFallback(sandboxId, host);
-      } catch (err) {
-        console.error("Failed to start sandbox:", err);
-        this._showError("Failed to start sandbox. Please try again.");
-      }
-    },
-
-    _showReady(url: string) {
-      this._stopAll();
-      this.state = "ready";
-      this.previewUrl = url;
-    },
-
-    _showError(message: string) {
-      this._stopAll();
-      this.state = "error";
-      this.errorMessage = message;
-    },
-
-    /** Clean up all timers and connections (called on ready or error). */
-    _stopAll() {
-      this._settled = true;
-      if (this._pollFallbackTimer) {
-        clearTimeout(this._pollFallbackTimer);
-        this._pollFallbackTimer = null;
-      }
-      if (this._pollTimer) {
-        clearInterval(this._pollTimer);
-        this._pollTimer = null;
-      }
-      if (this._ws) {
-        this._ws.onclose = null; // prevent auto-reconnect
-        this._ws.close();
-        this._ws = null;
-      }
-    },
-
-    /**
-     * Schedule the polling fallback with a delay.
-     * If WebSocket has delivered any message by the time the timer fires,
-     * polling is skipped entirely — WS is working fine.
-     */
-    _schedulePollFallback(sandboxId: string, host: string) {
-      this._pollFallbackTimer = setTimeout(() => {
-        if (this._settled || this._wsHasDelivered) return;
-        console.warn("WebSocket silent after timeout — starting poll fallback");
-        this._startPolling(sandboxId, host);
-      }, POLL_FALLBACK_DELAY);
-    },
-
-    /**
-     * Poll the startSandbox action to check for ready state.
-     * Self-cancels if WebSocket comes alive mid-poll.
-     */
-    _startPolling(sandboxId: string, host: string) {
-      if (this._pollTimer) return;
-      this._pollTimer = setInterval(async () => {
-        if (this._settled || this._wsHasDelivered) {
-          if (this._pollTimer) {
-            clearInterval(this._pollTimer);
-            this._pollTimer = null;
-          }
-          return;
-        }
-        try {
-          const result = await actions.startSandbox({ sandboxId, host });
-          if (result.error) return;
-          // The action returns a discriminated union but TS narrows too
-          // aggressively after the "ready" check. Use a loose type here
-          // since polling just needs status + optional fields.
-          const data = result.data as { status: string; previewUrl?: string; message?: string };
-          if (data.status === "ready" && data.previewUrl) {
-            this._showReady(data.previewUrl);
-          } else if (data.status === "error") {
-            this._showError(data.message ?? "Sandbox initialization failed");
-          }
-        } catch {
-          // Swallow poll errors — this is a fallback, not critical path
-        }
-      }, POLL_INTERVAL);
-    },
-
-    /** Connect WebSocket for real-time progress from server-side init. */
-    _connectWebSocket(endpoint: string, sandboxId: string, host: string) {
-      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      this._ws = new WebSocket(
-        `${protocol}//${window.location.host}${endpoint}`,
-      );
-
-      this._ws.onmessage = (event: MessageEvent) => {
-        const data = JSON.parse(event.data);
-        // Only count substantive messages (progress/ready/error) as
-        // "delivered". The WS route may send a "connected" handshake ack
-        // which doesn't carry init state.
-        if (data.type === "progress" || data.type === "ready" || data.type === "error") {
-          this._wsHasDelivered = true;
-        }
-        this._handleMessage(data);
-      };
-
-      this._ws.onerror = () => {
-        console.warn("WebSocket error, relying on polling fallback");
-      };
-
-      this._ws.onclose = () => {
-        if (this._settled) return;
-        // Auto-reconnect — WS may close during container startup.
-        setTimeout(() => this._connectWebSocket(endpoint, sandboxId, host), 3000);
-      };
-    },
-
-    _handleMessage(data: Record<string, string>) {
-      switch (data.type) {
-        case "progress":
-          this.statusText = STEP_DESCRIPTIONS[data.step] ?? "Initializing...";
-          this.stepKey = data.step;
-          break;
-        case "ready":
-          this._showReady(data.previewUrl);
-          break;
-        case "error":
-          this._showError(data.message);
-          break;
-      }
+    destroy() {
+      this._preview?.destroy();
     },
   }));
 

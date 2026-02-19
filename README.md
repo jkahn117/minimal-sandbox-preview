@@ -4,6 +4,234 @@ A working demonstration of Cloudflare's Sandbox SDK using **Astro v6 beta** with
 
 Live at: **https://sandbox.cfsa.dev**
 
+## Reusable libraries
+
+This project includes two libraries extracted from the implementation that handle the boilerplate every Sandbox SDK project needs. They live in `src/lib/` and are ready to copy into other projects or extract into a shared package.
+
+### `SandboxManager` — Server-side lifecycle manager
+
+**File:** `src/lib/sandbox-manager.ts`
+
+Handles everything around your app-specific initialization logic: state tracking, TTL cleanup, WebSocket broadcasts, isolate eviction recovery, and `PortAlreadyExposedError` handling.
+
+```typescript
+import { SandboxManager } from "./lib/sandbox-manager";
+
+const manager = new SandboxManager({
+  // Which port to expose as the preview URL
+  port: 3001,
+  // Token for the preview URL pattern: https://{port}-{sandboxId}-{token}.{host}/
+  token: "my-app",
+  // Optional: name for the exposed port
+  portName: "my-server",
+  // Container auto-sleep at the DO level (safety net for isolate eviction)
+  sleepAfter: "5m",
+  // JS-level TTL — destroys container after inactivity
+  ttlMs: 5 * 60 * 1000,
+
+  // Your app-specific init logic. This is the only part that changes
+  // between projects. The manager handles everything else.
+  async initialize({ sandbox, progress }) {
+    progress("writing_files");
+    await sandbox.writeFile("/workspace/server.js", myServerCode);
+
+    progress("starting_server");
+    await sandbox.startProcess("node server.js", {
+      cwd: "/workspace",
+      env: { PORT: "3001" },
+    });
+
+    progress("waiting_for_ready");
+    // ... your health check logic ...
+
+    // Don't call exposePort() here — the manager does it after
+    // this callback returns, with PortAlreadyExposedError handling.
+  },
+});
+```
+
+**What the manager handles for you:**
+
+| Concern | What it does |
+|---|---|
+| **Idempotent start** | State machine: idle → initializing → ready \| error. Safe to call from polling. |
+| **TTL cleanup** | `setTimeout`-based destroy with `touch()` on every status check. Configurable via `ttlMs`. |
+| **`sleepAfter` safety net** | Passed to `getSandbox()` so containers auto-sleep even if the isolate is evicted before the JS timer fires. |
+| **Isolate eviction recovery** | Calls `getExposedPorts()` before init. If the port is already exposed (container survived an isolate eviction), skips init and goes to "ready". |
+| **`PortAlreadyExposedError`** | Caught on `exposePort()`. Reconstructs the preview URL from the known pattern and treats it as success. |
+| **WebSocket broadcast** | Tracks connections, broadcasts progress/ready/error to all clients. Dead connections are pruned automatically. |
+| **WS upgrade handler** | `handleWebSocketUpgrade(request, sandboxId)` — handles the full upgrade lifecycle. Sends current state to newly connected clients. |
+| **No "connected" ack** | Avoids sending a meaningless handshake that would suppress the client's polling fallback. |
+
+**Using in an Astro action:**
+
+```typescript
+// src/actions/index.ts
+import { sandboxManager } from "../lib/sandbox";
+
+export const server = {
+  startSandbox: defineAction({
+    input: z.object({ sandboxId: z.string(), host: z.string() }),
+    handler: async (input, context) => {
+      const { cfContext } = context.locals;
+      const { Sandbox } = env as Env;
+      return sandboxManager.start(
+        input.sandboxId,
+        input.host,
+        Sandbox,
+        cfContext.waitUntil.bind(cfContext),
+      );
+    },
+  }),
+};
+```
+
+**Using in a WebSocket API route:**
+
+```typescript
+// src/pages/api/ws.ts
+import { sandboxManager } from "../../lib/sandbox";
+
+export const GET: APIRoute = async ({ request, url }) => {
+  const sandboxId = url.searchParams.get("sandboxId");
+  if (!sandboxId) return new Response("Missing sandboxId", { status: 400 });
+  return sandboxManager.handleWebSocketUpgrade(request, sandboxId);
+};
+```
+
+### `SandboxPreview` — Client-side WS + polling state machine
+
+**File:** `src/lib/sandbox-preview.ts`
+
+Framework-agnostic. Manages WebSocket connection (primary channel) with deferred polling fallback. Works with any UI layer — Alpine, React, Svelte, vanilla JS.
+
+```typescript
+import { SandboxPreview } from "./lib/sandbox-preview";
+
+const preview = new SandboxPreview({
+  // Trigger server-side init. Return { data: { status, previewUrl?, wsEndpoint? } }
+  // or { error: { message } }.
+  start: () => actions.startSandbox({ sandboxId, host }),
+
+  // Check server-side status (same call, idempotent).
+  poll: () => actions.startSandbox({ sandboxId, host }),
+
+  // Optional tuning (defaults shown)
+  pollFallbackDelay: 5000, // Wait 5s before activating polling
+  pollInterval: 5000,       // Poll every 5s (backup only)
+  wsReconnectDelay: 3000,   // Reconnect WS after 3s on close
+});
+
+// Subscribe to events — wire these to your UI framework
+preview.on("progress", ({ step }) => {
+  console.log("Step:", step);
+});
+
+preview.on("ready", ({ previewUrl }) => {
+  document.querySelector("iframe")!.src = previewUrl;
+});
+
+preview.on("error", ({ message }) => {
+  console.error("Failed:", message);
+});
+
+// Start the flow
+preview.init();
+
+// Clean up on unmount
+preview.destroy();
+```
+
+**What the preview client handles for you:**
+
+| Concern | What it does |
+|---|---|
+| **WebSocket primary** | Connects to the `wsEndpoint` from the start response. Auto-reconnects on close. |
+| **Deferred polling** | Only activates if WS is silent after `pollFallbackDelay`. Self-cancels if WS comes alive. |
+| **`wsHasDelivered` tracking** | Only counts substantive messages (progress/ready/error), not handshake acks. |
+| **Terminal state cleanup** | On ready or error: closes WS, clears all timers, stops polling. |
+| **Event emitter** | `on("progress" \| "ready" \| "error", handler)` returns an unsubscribe function. |
+| **`destroy()`** | Full cleanup — timers, WS, listeners. Call on component unmount. |
+
+**Example: wiring to Alpine.js** (as done in this project):
+
+```typescript
+Alpine.data("sandbox", () => ({
+  state: "loading",
+  statusText: "Initializing...",
+  previewUrl: "",
+  errorMessage: "",
+
+  init() {
+    const preview = new SandboxPreview({ start: callAction, poll: callAction });
+    preview.on("progress", ({ step }) => { this.statusText = descriptions[step]; });
+    preview.on("ready", ({ previewUrl }) => { this.state = "ready"; this.previewUrl = previewUrl; });
+    preview.on("error", ({ message }) => { this.state = "error"; this.errorMessage = message; });
+    preview.init();
+  },
+}));
+```
+
+**Example: wiring to React:**
+
+```tsx
+function SandboxView({ sandboxId, host }: Props) {
+  const [state, setState] = useState<"loading" | "ready" | "error">("loading");
+  const [previewUrl, setPreviewUrl] = useState("");
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    const preview = new SandboxPreview({
+      start: () => startSandbox(sandboxId, host),
+      poll: () => startSandbox(sandboxId, host),
+    });
+    preview.on("ready", ({ previewUrl }) => { setState("ready"); setPreviewUrl(previewUrl); });
+    preview.on("error", ({ message }) => { setState("error"); setError(message); });
+    preview.init();
+    return () => preview.destroy();
+  }, [sandboxId, host]);
+
+  if (state === "loading") return <Spinner />;
+  if (state === "error") return <Error message={error} />;
+  return <iframe src={previewUrl} />;
+}
+```
+
+### How the pieces fit together
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Your project                                                   │
+│                                                                 │
+│  src/lib/sandbox.ts          ← You write this (app-specific)   │
+│    new SandboxManager({                                         │
+│      port, token,                                               │
+│      initialize: async ({ sandbox, progress }) => {             │
+│        // your files, processes, health checks                  │
+│      }                                                          │
+│    })                                                           │
+│                                                                 │
+│  src/lib/sandbox-manager.ts  ← Reusable (copy or import)       │
+│    State map, TTL, broadcast, recovery, WS upgrade              │
+│                                                                 │
+│  src/lib/sandbox-preview.ts  ← Reusable (copy or import)       │
+│    WS + polling state machine, event emitter                    │
+│                                                                 │
+│  src/actions/index.ts        ← Thin: manager.start()           │
+│  src/pages/api/ws.ts         ← Thin: manager.handleWsUpgrade() │
+│  src/components/             ← Thin: SandboxPreview + your UI  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+To use in a new project:
+
+1. Copy `sandbox-manager.ts` and `sandbox-preview.ts` into your `src/lib/`
+2. Create your own `sandbox.ts` that instantiates `SandboxManager` with your `initialize` callback
+3. Wire the action and WS route to the manager (2-3 lines each)
+4. Wire `SandboxPreview` to your UI framework of choice
+
+---
+
 ## Why Astro v6 beta?
 
 Astro v6 (`6.0.0-beta.13`) with `@astrojs/cloudflare@13.0.0-beta.8` significantly simplifies building on Cloudflare Workers:
@@ -25,12 +253,12 @@ Browser                          Cloudflare Worker (Astro v6)
   │  (generates sandbox-${randomUUID()})  │
   │                                      │
   ├─ actions.startSandbox() ────────────►│ Astro Action (RPC)
-  │  (sandboxId + host)                  │   └─ env.Sandbox DO binding
+  │  (sandboxId + host)                  │   └─ sandboxManager.start()
   │                                      │   └─ waitUntil(initPromise)
   │◄─ { status, wsEndpoint } ────────────┤
   │                                      │
   ├─ WebSocket /api/ws ─────────────────►│ API Route (upgrade)
-  │◄─ progress: creating_workspace       │   └─ shared module state
+  │◄─ progress: creating_workspace       │   └─ sandboxManager.handleWsUpgrade()
   │◄─ progress: writing_files            │
   │◄─ progress: starting_server          │
   │◄─ progress: waiting_for_ready        │
@@ -48,35 +276,35 @@ Browser                          Cloudflare Worker (Astro v6)
 ### Data flow
 
 1. **Page load** — Astro SSR renders `index.astro`, generating a unique `sandboxId` via `crypto.randomUUID()`
-2. **Astro Action** — Client calls `actions.startSandbox({ sandboxId, host })` (type-safe RPC). The action accesses the `Sandbox` Durable Object binding via `cloudflare:workers` env and kicks off initialization with `waitUntil()`.
-3. **WebSocket (primary)** — Client connects to `/api/ws?sandboxId=...` for real-time progress. The WebSocket route and the action share module-level state (`src/lib/sandbox.ts`) so the WS handler can relay initialization progress.
-4. **Polling (deferred fallback)** — If WebSocket is silent after 5 seconds (broadcasts from `waitUntil` don't always reach clients), polling activates as a backup. Self-cancels if WS comes alive.
-5. **Ready** — Once the Express server is healthy and the port is exposed, a `ready` message with the preview URL is broadcast to all connected WebSocket clients.
+2. **Astro Action** — Client calls `actions.startSandbox({ sandboxId, host })` (type-safe RPC). The action calls `sandboxManager.start()` which accesses the `Sandbox` Durable Object binding and kicks off initialization with `waitUntil()`.
+3. **WebSocket (primary)** — Client's `SandboxPreview` connects to `/api/ws?sandboxId=...` for real-time progress. The manager broadcasts initialization steps to all connected clients.
+4. **Polling (deferred fallback)** — If WebSocket is silent after 5 seconds (broadcasts from `waitUntil` don't always reach clients), `SandboxPreview` activates polling as a backup. Self-cancels if WS comes alive.
+5. **Ready** — Once the Express server is healthy and the port is exposed, a `ready` message with the preview URL is broadcast.
 6. **Preview** — The component shows an iframe. Requests to the preview URL subdomain (`3001-{sandboxId}-express.sandbox.cfsa.dev`) hit Astro middleware, which calls `proxyToSandbox()` to route them to the correct container.
 
 ### Container lifecycle
 
-Each container has a 5-minute TTL. Active users keep the container alive via `touchSandbox()` on every status check. When the TTL expires, `sandbox.destroy()` kills the container and frees the instance slot.
+Each container has a 5-minute TTL managed by `SandboxManager`. Active users keep the container alive via `touch()` on every status check. When the TTL expires, `sandbox.destroy()` kills the container and frees the instance slot.
 
 ```
 Page load → init → container starts → ready
   ↓
-touchSandbox() → scheduleDestroy(5min)
+touch() → scheduleDestroy(5min)
   ↓
-Each poll/status check → touchSandbox() → timer reset
+Each poll/status check → touch() → timer reset
   ↓
 User leaves → 5min → destroySandbox() → container killed
   ↓
 Safety net: sleepAfter:"5m" at DO level (covers isolate eviction)
 ```
 
-The `setTimeout` lives in the Worker isolate. If the isolate is evicted (~30s of no requests), the timer is lost. The `sleepAfter: "5m"` on `getSandbox()` is a belt-and-suspenders fallback — the container auto-sleeps at the DO level.
+The `setTimeout` lives in the Worker isolate. If the isolate is evicted (~30s of no requests), the timer is lost. The `sleepAfter` on `getSandbox()` is a belt-and-suspenders fallback — the container auto-sleeps at the DO level.
 
 ## Project structure
 
 ```
 .
-├── package.json                    # Dependencies (Astro v6 beta, Sandbox SDK, Zod v4)
+├── package.json                    # Dependencies (Astro v6 beta, Sandbox SDK, Alpine.js)
 ├── astro.config.mjs                # Astro config with Cloudflare adapter
 ├── wrangler.jsonc                  # Worker, DO, containers (max_instances:5), routes
 ├── worker-configuration.d.ts       # Auto-generated types (wrangler types)
@@ -94,15 +322,17 @@ The `setTimeout` lives in the Worker isolate. If the isolate is evicted (~30s of
     ├── middleware.ts                # proxyToSandbox() — routes preview URL requests to containers
     ├── env.d.ts                    # Astro type declarations
     ├── lib/
-    │   └── sandbox.ts              # Per-sandboxId state Map, init, TTL cleanup, WS broadcast
+    │   ├── sandbox-manager.ts      # ★ Reusable: server-side lifecycle manager
+    │   ├── sandbox-preview.ts      # ★ Reusable: client-side WS + polling state machine
+    │   └── sandbox.ts              # App-specific: SandboxManager instance with Express init
     ├── actions/
-    │   └── index.ts                # Astro action: startSandbox (RPC, type-safe)
+    │   └── index.ts                # Astro action: sandboxManager.start() (thin wrapper)
     ├── components/
-    │   └── SandboxComponent.astro  # UI: WS-primary + deferred polling fallback + iframe
+    │   └── SandboxComponent.astro  # Alpine.js UI + SandboxPreview bindings
     └── pages/
         ├── index.astro             # Main page (unique sandboxId per view)
         └── api/
-            └── ws.ts               # WebSocket endpoint for progress updates
+            └── ws.ts               # WebSocket endpoint (thin: manager.handleWsUpgrade())
 ```
 
 ## Key implementation details
@@ -148,24 +378,6 @@ export const onRequest = defineMiddleware(async ({ request }, next) => {
 });
 ```
 
-### Astro Actions for type-safe RPC (`src/actions/index.ts`)
-
-The action accepts both `sandboxId` and `host`, uses `cloudflare:workers` for env access, and passes `waitUntil` to keep the init promise alive:
-
-```typescript
-export const server = {
-  startSandbox: defineAction({
-    input: z.object({ sandboxId: z.string(), host: z.string() }),
-    handler: async (input, context) => {
-      const { cfContext } = context.locals;
-      const waitUntil = cfContext.waitUntil.bind(cfContext);
-      const { Sandbox } = env as Env;
-      return startSandbox(input.sandboxId, input.host, Sandbox, waitUntil);
-    },
-  }),
-};
-```
-
 ### `waitUntil` is required
 
 Fire-and-forget async functions get killed by workerd. The sandbox initialization is long-running (~5-10s in production, up to 40s in dev), so `waitUntil()` from `Astro.locals.cfContext` keeps the worker alive.
@@ -177,10 +389,6 @@ Top-level `import { getSandbox } from "@cloudflare/sandbox"` fails in Astro API 
 ```typescript
 const { getSandbox } = await import("@cloudflare/sandbox");
 ```
-
-### Isolate eviction recovery
-
-Worker isolates can be evicted after ~30s of no requests or on deploy, losing the in-memory state `Map`. But the container keeps running. On the next request, `initializeSandbox()` calls `sandbox.getExposedPorts()` first — if port 3001 is already exposed, it skips the full init and goes straight to "ready". This prevents `PortAlreadyExposedError` loops and avoids redundant work on an already-running container.
 
 ### Containers config must be at top level in `wrangler.jsonc`
 
@@ -258,18 +466,17 @@ The post-build patch (`scripts/patch-deploy-config.mjs`) is necessary because `a
 
 A known Astro + Cloudflare adapter bug ([withastro/astro#14511](https://github.com/withastro/astro/issues/14511)). With `nodejs_compat`, workerd exposes native `process` v2, making Astro think it's Node.js and return AsyncIterable response bodies. workerd's `Response` constructor doesn't support AsyncIterable, so the body gets coerced to `"[object Object]"`.
 
-**Fix:** Enable `fetch_iterable_type_support` compatibility flag (auto-enables at compat date `2026-02-19`):
+**Fix:** Add `disable_nodejs_process_v2` to compatibility flags. This prevents Astro from misdetecting the runtime in both dev and production:
 
 ```jsonc
-"compatibility_date": "2026-02-19",
-"compatibility_flags": ["nodejs_compat"]
+"compatibility_flags": ["nodejs_compat", "disable_nodejs_process_v2"]
 ```
 
-Alternative: `disable_nodejs_process_v2` flag prevents Astro from detecting Node.js in the first place.
+The `fetch_iterable_type_support` flag (auto-enabled at compat date `2026-02-19`) patches the symptom on the workerd side, but doesn't fix dev due to a chunk evaluation ordering issue where Astro's `isNode` check runs before the process polyfill is applied. `disable_nodejs_process_v2` attacks the root cause.
 
 ### WebSocket broadcasts from `waitUntil` are unreliable
 
-Broadcasts from `waitUntil` don't always reach WebSocket clients (cross-I/O-context issue in workerd). The client has a deferred polling fallback that activates after 5 seconds of WS silence. This is a known limitation, not a bug in this codebase.
+Broadcasts from `waitUntil` don't always reach WebSocket clients (cross-I/O-context issue in workerd). The `SandboxPreview` client has a deferred polling fallback that activates after 5 seconds of WS silence. This is a known limitation, not a bug in this codebase.
 
 ### Post-build config patching
 
@@ -299,11 +506,7 @@ Expected noise in logs after deploys. Old DOs from previous sandbox IDs receive 
 
 ### `PortAlreadyExposedError` in logs
 
-The container persisted across an isolate eviction or deploy. The `getExposedPorts()` recovery check at the top of `initializeSandbox()` handles this — it detects the already-exposed port and skips to "ready". If you see this error looping, check that the recovery path is working (look for "Container already has port 3001 exposed" in logs).
-
-### LSP errors in `src/worker/index.ts` or `astro:actions`
-
-Ghost errors from stale caches or virtual modules. Run `pnpm types` and restart your editor. The `src/worker/index.ts` file was removed (replaced by `src/worker-entry.ts`).
+The container persisted across an isolate eviction or deploy. The `SandboxManager` handles this automatically — it detects the already-exposed port via `getExposedPorts()` and skips to "ready". If you see this error looping, check that the recovery path is working (look for "Container already has port 3001 exposed" in logs).
 
 ## Key discoveries
 
@@ -321,7 +524,7 @@ The SDK package and Docker base image versions must match:
 
 ### `normalizeId: true` required
 
-Preview URLs extract the sandbox ID from the hostname, which is always lowercased (per RFC 3986). Pass `normalizeId: true` to `getSandbox()` so the DO ID matches.
+Preview URLs extract the sandbox ID from the hostname, which is always lowercased (per RFC 3986). The `SandboxManager` passes `normalizeId: true` to `getSandbox()` automatically.
 
 ### Local dev vs production
 
@@ -336,7 +539,7 @@ Preview URLs extract the sandbox ID from the hostname, which is always lowercase
 
 ## Decisions log
 
-All architectural decisions and problems solved are documented in [`_plan/4. decisions.md`](./_plan/4.%20decisions.md) (22 decisions).
+All architectural decisions and problems solved are documented in [`_plan/4. decisions.md`](./_plan/4.%20decisions.md) (25 decisions).
 
 ## Resources
 
