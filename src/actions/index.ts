@@ -6,6 +6,7 @@ import { startSandbox } from "../lib/sandbox";
 export const server = {
   startSandbox: defineAction({
     input: z.object({
+      sandboxId: z.string(),
       host: z.string(),
     }),
     handler: async (input, context) => {
@@ -13,7 +14,7 @@ export const server = {
       const waitUntil = cfContext.waitUntil.bind(cfContext);
       const { Sandbox } = env as Env;
 
-      return startSandbox(input.host, Sandbox, waitUntil);
+      return startSandbox(input.sandboxId, input.host, Sandbox, waitUntil);
     },
   }),
 };

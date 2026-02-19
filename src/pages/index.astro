@@ -1,7 +1,8 @@
 ---
 import SandboxComponent from "../components/SandboxComponent.astro";
 
-// Get host from request
+// Unique sandbox per page view
+const sandboxId = `sandbox-${crypto.randomUUID()}`;
 const host = Astro.url.host;
 ---
 
@@ -35,6 +36,6 @@ const host = Astro.url.host;
     Express.js server running inside Cloudflare Sandbox container
   </div>
   
-  <SandboxComponent host={host} />
+  <SandboxComponent sandboxId={sandboxId} host={host} />
 </body>
 </html>

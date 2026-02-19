@@ -17,7 +17,7 @@
       "class_name": "Sandbox",
       "image": "./sandbox/Dockerfile",
       "instance_type": "lite",
-      "max_instances": 1,
+      "max_instances": 5,
     },
   ],
   // Durable Objects binding
@@ -47,7 +47,7 @@
       "custom_domain": true,
     },
     {
-      "pattern": "*.sandbox.cfsa.dev",
+      "pattern": "*.sandbox.cfsa.dev/*",
       "zone_name": "cfsa.dev",
     },
   ],
