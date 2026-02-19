@@ -3,21 +3,10 @@ import cloudflare from "@astrojs/cloudflare";
 
 export default defineConfig({
   output: "server",
-  adapter: cloudflare({
-    runtime: {
-      mode: "local",
-    },
-    platformProxy: {
-      enabled: true,
-    },
-  }),
+  adapter: cloudflare(),
   vite: {
     build: {
-      rollupOptions: {
-        input: {
-          worker: "./src/worker/index.ts",
-        },
-      },
+      minify: false,
     },
   },
 });

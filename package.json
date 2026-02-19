@@ -3,17 +3,17 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev",
-    "build": "astro build",
+    "dev": "wrangler types && astro dev",
+    "build": "wrangler types && astro build",
     "preview": "astro preview",
     "types": "wrangler types",
-    "deploy": "astro build && wrangler deploy --env production"
+    "deploy": "wrangler types && astro build && wrangler deploy --env production"
   },
   "dependencies": {
-    "@astrojs/cloudflare": "^12.0.0",
+    "@astrojs/cloudflare": "13.0.0-beta.8",
     "@cloudflare/sandbox": "0.7.4",
-    "astro": "^5.0.0",
-    "hono": "^4.0.0"
+    "astro": "6.0.0-beta.13",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@types/node": "^25.2.3",

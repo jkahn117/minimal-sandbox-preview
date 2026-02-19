@@ -1,0 +1,294 @@
+---
+interface Props {
+  host: string;
+}
+
+const { host } = Astro.props;
+---
+
+<div class="sandbox-container" data-host={host}>
+  <div class="loading-state" style="display: block;">
+    <div class="spinner"></div>
+    <div class="status-text">Initializing...</div>
+    <div class="step-indicator"></div>
+  </div>
+
+  <div class="ready-state" style="display: none;">
+    <div class="preview-url"></div>
+    <iframe src="" title="Sandbox Preview" loading="lazy"></iframe>
+  </div>
+
+  <div class="error-state" style="display: none;">
+    <div class="error-message"></div>
+    <button class="retry-btn">Retry</button>
+  </div>
+</div>
+
+<script>
+  import { actions } from "astro:actions";
+
+  const container = document.querySelector(".sandbox-container");
+  const host = container?.getAttribute("data-host");
+
+  let pollTimer: ReturnType<typeof setInterval> | null = null;
+  let ws: WebSocket | null = null;
+  let settled = false;
+
+  async function init() {
+    try {
+      updateStatus("Starting sandbox...");
+
+      // Call Astro action (RPC) to trigger initialization
+      const result = await actions.startSandbox({
+        host: host ?? window.location.host,
+      });
+
+      if (result.error) {
+        showError(result.error.message ?? "Failed to start sandbox");
+        return;
+      }
+
+      const { data } = result;
+
+      if (data.status === "ready" && data.previewUrl) {
+        showReady(data.previewUrl);
+        return;
+      }
+
+      // Connect WebSocket for real-time progress
+      const wsEndpoint = data.wsEndpoint || "/api/ws";
+      connectWebSocket(wsEndpoint);
+
+      // Also poll the action as a fallback — WebSocket broadcasts from
+      // waitUntil may not deliver reliably in workerd
+      startPolling();
+    } catch (err) {
+      console.error("Failed to start sandbox:", err);
+      showError("Failed to start sandbox. Please try again.");
+    }
+  }
+
+  function stopAll() {
+    settled = true;
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+    if (ws) {
+      ws.onclose = null; // prevent reconnect
+      ws.close();
+      ws = null;
+    }
+  }
+
+  function startPolling() {
+    pollTimer = setInterval(async () => {
+      if (settled) return;
+      try {
+        const result = await actions.startSandbox({
+          host: host ?? window.location.host,
+        });
+        if (result.error) return;
+        const { data } = result;
+        if (data.status === "ready" && data.previewUrl) {
+          stopAll();
+          showReady(data.previewUrl);
+        }
+      } catch {
+        // ignore poll errors
+      }
+    }, 3000);
+  }
+
+  function connectWebSocket(endpoint: string) {
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    ws = new WebSocket(
+      `${protocol}//${window.location.host}${endpoint}`,
+    );
+
+    ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      handleMessage(data);
+    };
+
+    ws.onerror = () => {
+      // Don't show error — polling fallback will handle it
+      console.warn("WebSocket error, relying on polling fallback");
+    };
+
+    ws.onclose = () => {
+      if (settled) return;
+      // Auto-reconnect if not ready
+      setTimeout(() => connectWebSocket(endpoint), 3000);
+    };
+  }
+
+  function handleMessage(data: Record<string, string>) {
+    switch (data.type) {
+      case "progress":
+        updateStep(data.step);
+        break;
+      case "ready":
+        stopAll();
+        showReady(data.previewUrl);
+        break;
+      case "error":
+        stopAll();
+        showError(data.message);
+        break;
+    }
+  }
+
+  function updateStatus(text: string) {
+    const statusEl = container?.querySelector(".status-text");
+    if (statusEl) statusEl.textContent = text;
+  }
+
+  function updateStep(step: string) {
+    const statusEl = container?.querySelector(".status-text");
+    const stepEl = container?.querySelector(".step-indicator");
+
+    if (statusEl) statusEl.textContent = getStepDescription(step);
+    if (stepEl) stepEl.textContent = step;
+  }
+
+  function showReady(url: string) {
+    const loadingEl = container?.querySelector(
+      ".loading-state",
+    ) as HTMLElement | null;
+    const readyEl = container?.querySelector(
+      ".ready-state",
+    ) as HTMLElement | null;
+    const urlEl = container?.querySelector(".preview-url");
+    const iframeEl = container?.querySelector("iframe");
+
+    if (loadingEl) loadingEl.style.display = "none";
+    if (readyEl) readyEl.style.display = "block";
+    if (urlEl) urlEl.textContent = url;
+    if (iframeEl) iframeEl.src = url;
+  }
+
+  function showError(message: string) {
+    const loadingEl = container?.querySelector(
+      ".loading-state",
+    ) as HTMLElement | null;
+    const errorEl = container?.querySelector(
+      ".error-state",
+    ) as HTMLElement | null;
+    const errorMsgEl = container?.querySelector(".error-message");
+
+    if (loadingEl) loadingEl.style.display = "none";
+    if (errorEl) errorEl.style.display = "block";
+    if (errorMsgEl) errorMsgEl.textContent = message;
+  }
+
+  function getStepDescription(step: string) {
+    const steps: Record<string, string> = {
+      creating_workspace: "Creating workspace...",
+      writing_files: "Setting up Express server...",
+      installing_dependencies: "Installing dependencies...",
+      starting_server: "Starting Express server...",
+      waiting_for_ready: "Waiting for server to be ready...",
+      exposing_port: "Configuring preview URL...",
+    };
+    return steps[step] || "Initializing...";
+  }
+
+  // Retry button handler
+  const retryBtn = container?.querySelector(".retry-btn");
+  if (retryBtn) {
+    retryBtn.addEventListener("click", () => {
+      location.reload();
+    });
+  }
+
+  // Auto-start
+  init();
+</script>
+
+<style>
+  .sandbox-container {
+    max-width: 1200px;
+    margin: 0 auto;
+  }
+
+  .loading-state {
+    background: white;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    padding: 40px;
+    text-align: center;
+    height: 400px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .spinner {
+    width: 40px;
+    height: 40px;
+    border: 4px solid #e3f2fd;
+    border-top: 4px solid #2196f3;
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+    margin-bottom: 20px;
+  }
+
+  @keyframes spin {
+    0% {
+      transform: rotate(0deg);
+    }
+    100% {
+      transform: rotate(360deg);
+    }
+  }
+
+  .step-indicator {
+    color: #666;
+    font-size: 14px;
+    margin-top: 10px;
+    font-family: monospace;
+  }
+
+  .preview-url {
+    background: #e3f2fd;
+    padding: 10px;
+    border-radius: 4px;
+    margin-bottom: 20px;
+    font-family: monospace;
+    word-break: break-all;
+  }
+
+  iframe {
+    width: 100%;
+    height: 600px;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    background: white;
+  }
+
+  .error-state {
+    text-align: center;
+    padding: 40px;
+  }
+
+  .error-message {
+    color: #d32f2f;
+    margin-bottom: 20px;
+  }
+
+  button {
+    padding: 10px 20px;
+    font-size: 16px;
+    cursor: pointer;
+    background: #2196f3;
+    color: white;
+    border: none;
+    border-radius: 4px;
+  }
+
+  button:hover {
+    background: #1976d2;
+  }
+</style>

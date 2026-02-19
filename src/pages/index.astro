@@ -1,6 +1,8 @@
 ---
-// This page is handled by the Worker
-// The Worker returns HTML with an iframe pointing to the sandbox preview
+import SandboxComponent from "../components/SandboxComponent.astro";
+
+// Get host from request
+const host = Astro.url.host;
 ---
 
 <!DOCTYPE html>
@@ -8,13 +10,31 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Sandbox SDK Example</title>
+  <title>Cloudflare Sandbox SDK Minimal Example</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      margin: 0;
+      padding: 20px;
+      background: #f5f5f5;
+    }
+    h1 {
+      text-align: center;
+      margin-bottom: 10px;
+    }
+    .subtitle {
+      text-align: center;
+      color: #666;
+      margin-bottom: 30px;
+    }
+  </style>
 </head>
 <body>
-  <p>Loading sandbox...</p>
-  <script>
-    // Trigger Worker initialization by fetching root
-    window.location.href = '/';
-  </script>
+  <h1>Cloudflare Sandbox SDK Minimal Example</h1>
+  <div class="subtitle">
+    Express.js server running inside Cloudflare Sandbox container
+  </div>
+  
+  <SandboxComponent host={host} />
 </body>
 </html>
