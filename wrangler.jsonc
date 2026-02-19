@@ -3,10 +3,14 @@
   "name": "sandbox-minimal-example",
   "main": "./src/worker-entry.ts",
   "compatibility_date": "2026-02-19",
-  // fetch_iterable_type_support: workaround for Astro returning AsyncIterable
-  // response bodies when nodejs_compat is enabled. Auto-enables at compat date
-  // 2026-02-19. See https://github.com/withastro/astro/issues/14511
-  "compatibility_flags": ["nodejs_compat"],
+  // disable_nodejs_process_v2: prevents Astro from misdetecting workerd as
+  // Node.js (via process v2), which causes it to return AsyncIterable response
+  // bodies → [object Object]. fetch_iterable_type_support (auto-enabled at
+  // compat date 2026-02-19) should fix this on the workerd side, but the
+  // vite-plugin dev path still hits the chunk-ordering issue where Astro's
+  // isNode check evaluates before the process polyfill is applied.
+  // See https://github.com/withastro/astro/issues/14511
+  "compatibility_flags": ["nodejs_compat", "disable_nodejs_process_v2"],
   "observability": {
     "enabled": true,
   },

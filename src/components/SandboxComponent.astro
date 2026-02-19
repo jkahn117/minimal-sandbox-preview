@@ -7,299 +7,274 @@ interface Props {
 const { sandboxId, host } = Astro.props;
 ---
 
-<div class="sandbox-container" data-sandbox-id={sandboxId} data-host={host}>
-  <div class="loading-state" style="display: block;">
+<!--
+  Client-side sandbox initialization and progress tracking.
+
+  ## Progress strategy: WebSocket primary, polling as deferred fallback
+
+  Sandbox initialization runs server-side inside `waitUntil()` and takes
+  30-40s. The client needs to know when it's done. Two channels exist:
+
+  1. **WebSocket (primary)** — Connects to `/api/ws?sandboxId=...` for
+     real-time progress broadcasts from the server. This is the preferred
+     channel and delivers step-by-step updates (creating workspace,
+     writing files, starting server, etc.).
+
+  2. **Polling (deferred fallback)** — Calls `actions.startSandbox()`
+     periodically to check the server-side state. Only activates if
+     WebSocket has not delivered ANY message after 10 seconds.
+
+  Why polling exists at all: WebSocket broadcasts from `waitUntil()`
+  don't reliably reach clients in workerd. The init runs in a detached
+  promise (kept alive by `waitUntil`), and the WS connections are
+  registered in a different request context. In practice, WS messages
+  sometimes never arrive. Polling covers this gap.
+
+  Why polling is deferred (not immediate): The original implementation
+  polled every 3s starting immediately alongside WebSocket. This caused
+  duplicate paired POST requests — the initial action call takes ~3s,
+  and the first poll tick fires nearly simultaneously. With 5 concurrent
+  containers allowed (max_instances: 5), this traffic was wasteful and
+  made debugging harder. See decision 19 in _plan/4. decisions.md.
+
+  Flow:
+    init() → action call → connect WS → schedule fallback (5s)
+      ├─ WS delivers progress/ready/error → wsHasDelivered=true → polling skipped
+      └─ WS silent after 5s → poll every 5s → self-cancels if WS wakes
+-->
+
+<div
+  class="sandbox-container"
+  x-data="sandbox"
+  data-sandbox-id={sandboxId}
+  data-host={host}
+>
+  <div class="loading-state" x-show="state === 'loading'">
     <div class="spinner"></div>
-    <div class="status-text">Initializing...</div>
-    <div class="step-indicator"></div>
+    <div class="status-text" x-text="statusText"></div>
+    <div class="step-indicator" x-text="stepKey"></div>
   </div>
 
-  <div class="ready-state" style="display: none;">
-    <div class="preview-url"></div>
-    <iframe src="" title="Sandbox Preview" loading="lazy"></iframe>
+  <div class="ready-state" x-show="state === 'ready'" x-cloak>
+    <div class="preview-url" x-text="previewUrl"></div>
+    <iframe title="Sandbox Preview" loading="lazy" :src="previewUrl"></iframe>
   </div>
 
-  <div class="error-state" style="display: none;">
-    <div class="error-message"></div>
-    <button class="retry-btn">Retry</button>
+  <div class="error-state" x-show="state === 'error'" x-cloak>
+    <div class="error-message" x-text="errorMessage"></div>
+    <button class="retry-btn" @click="location.reload()">Retry</button>
   </div>
 </div>
 
 <script>
   /**
-   * Client-side sandbox initialization and progress tracking.
-   *
-   * ## Progress strategy: WebSocket primary, polling as deferred fallback
-   *
-   * Sandbox initialization runs server-side inside `waitUntil()` and takes
-   * 30-40s. The client needs to know when it's done. Two channels exist:
-   *
-   * 1. **WebSocket (primary)** — Connects to `/api/ws?sandboxId=...` for
-   *    real-time progress broadcasts from the server. This is the preferred
-   *    channel and delivers step-by-step updates (creating workspace,
-   *    writing files, starting server, etc.).
-   *
-   * 2. **Polling (deferred fallback)** — Calls `actions.startSandbox()`
-   *    periodically to check the server-side state. Only activates if
-   *    WebSocket has not delivered ANY message after 10 seconds.
-   *
-   * Why polling exists at all: WebSocket broadcasts from `waitUntil()`
-   * don't reliably reach clients in workerd. The init runs in a detached
-   * promise (kept alive by `waitUntil`), and the WS connections are
-   * registered in a different request context. In practice, WS messages
-   * sometimes never arrive. Polling covers this gap.
-   *
-   * Why polling is deferred (not immediate): The original implementation
-   * polled every 3s starting immediately alongside WebSocket. This caused
-   * duplicate paired POST requests — the initial action call takes ~3s,
-   * and the first poll tick fires nearly simultaneously. With 5 concurrent
-   * containers allowed (max_instances: 5), this traffic was wasteful and
-   * made debugging harder. See decision 19 in _plan/4. decisions.md.
-   *
-   * Flow:
-   *   init() → action call → connect WS → schedule fallback (5s)
-   *     ├─ WS delivers progress/ready/error → wsHasDelivered=true → polling skipped
-   *     └─ WS silent after 5s → poll every 5s → self-cancels if WS wakes
+   * Astro's bundled <script> — only place where `astro:actions` imports work.
+   * Sets up Alpine.js data component and wires up the async init logic.
    */
+  import Alpine from "alpinejs";
   import { actions } from "astro:actions";
 
-  const container = document.querySelector(".sandbox-container");
-  const sandboxId = container?.getAttribute("data-sandbox-id");
-  const host = container?.getAttribute("data-host");
+  const STEP_DESCRIPTIONS: Record<string, string> = {
+    creating_workspace: "Creating workspace...",
+    writing_files: "Setting up Express server...",
+    starting_server: "Starting Express server...",
+    waiting_for_ready: "Waiting for server to be ready...",
+    exposing_port: "Configuring preview URL...",
+  };
 
-  let pollTimer: ReturnType<typeof setInterval> | null = null;
-  let pollFallbackTimer: ReturnType<typeof setTimeout> | null = null;
-  let ws: WebSocket | null = null;
-  /** True once we've reached a terminal state (ready or error) */
-  let settled = false;
-  /** True once the WebSocket has delivered at least one message */
-  let wsHasDelivered = false;
-
-  /** Grace period before polling activates (gives WS time to deliver).
-   *  Set to 5s — init can complete in ~5s, so we want the first poll
-   *  to fire shortly after init might be done. */
+  /** Grace period before polling activates (gives WS time to deliver). */
   const POLL_FALLBACK_DELAY = 5_000;
-  /** Polling interval — intentionally slow since this is a backup */
+  /** Polling interval — intentionally slow since this is a backup. */
   const POLL_INTERVAL = 5_000;
 
-  async function init() {
-    try {
-      updateStatus("Starting sandbox...");
+  // Read data attributes from the container element before Alpine.data
+  // runs, avoiding reliance on Alpine's `$el` magic property (which the
+  // Astro TS checker can't resolve).
+  const containerEl = document.querySelector<HTMLElement>(".sandbox-container");
+  const pageSandboxId = containerEl?.dataset.sandboxId ?? "";
+  const pageHost = containerEl?.dataset.host ?? window.location.host;
 
-      // 1. Single action call to trigger server-side initialization.
-      //    Returns immediately with "initializing" status (init runs in
-      //    waitUntil), or "ready" if a previous init already completed.
-      const result = await actions.startSandbox({
-        sandboxId: sandboxId ?? "",
-        host: host ?? window.location.host,
-      });
+  Alpine.data("sandbox", () => ({
+    // --- Reactive UI state ---
+    state: "loading" as "loading" | "ready" | "error",
+    statusText: "Initializing...",
+    stepKey: "",
+    previewUrl: "",
+    errorMessage: "",
 
-      if (result.error) {
-        showError(result.error.message ?? "Failed to start sandbox");
-        return;
-      }
+    // --- Internal (non-reactive) bookkeeping ---
+    _pollTimer: null as ReturnType<typeof setInterval> | null,
+    _pollFallbackTimer: null as ReturnType<typeof setTimeout> | null,
+    _ws: null as WebSocket | null,
+    _settled: false,
+    _wsHasDelivered: false,
 
-      const { data } = result;
+    init() {
+      this._start();
+    },
 
-      // Already ready (e.g. page refresh while container still alive)
-      if (data.status === "ready" && data.previewUrl) {
-        showReady(data.previewUrl);
-        return;
-      }
+    async _start() {
+      const sandboxId = pageSandboxId;
+      const host = pageHost;
 
-      // 2. Connect WebSocket — primary channel for progress updates
-      const wsEndpoint = data.wsEndpoint || `/api/ws?sandboxId=${sandboxId}`;
-      connectWebSocket(wsEndpoint);
-
-      // 3. Schedule deferred polling fallback — only activates if WS is
-      //    silent after POLL_FALLBACK_DELAY. See module docstring above.
-      schedulePollFallback();
-    } catch (err) {
-      console.error("Failed to start sandbox:", err);
-      showError("Failed to start sandbox. Please try again.");
-    }
-  }
-
-  /** Clean up all timers and connections (called on ready or error) */
-  function stopAll() {
-    settled = true;
-    if (pollFallbackTimer) {
-      clearTimeout(pollFallbackTimer);
-      pollFallbackTimer = null;
-    }
-    if (pollTimer) {
-      clearInterval(pollTimer);
-      pollTimer = null;
-    }
-    if (ws) {
-      ws.onclose = null; // prevent auto-reconnect
-      ws.close();
-      ws = null;
-    }
-  }
-
-  /**
-   * Schedule the polling fallback with a delay.
-   * If WebSocket has delivered any message by the time the timer fires,
-   * polling is skipped entirely — WS is working fine.
-   */
-  function schedulePollFallback() {
-    pollFallbackTimer = setTimeout(() => {
-      if (settled || wsHasDelivered) return;
-      console.warn("WebSocket silent after timeout — starting poll fallback");
-      startPolling();
-    }, POLL_FALLBACK_DELAY);
-  }
-
-  /**
-   * Poll the startSandbox action to check for ready state.
-   * Self-cancels if WebSocket comes alive mid-poll.
-   */
-  function startPolling() {
-    if (pollTimer) return; // guard against duplicate timers
-    pollTimer = setInterval(async () => {
-      if (settled || wsHasDelivered) {
-        // WS came alive after polling started — stop polling
-        if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-        return;
-      }
       try {
-        const result = await actions.startSandbox({
-          sandboxId: sandboxId ?? "",
-          host: host ?? window.location.host,
-        });
-        if (result.error) return;
-        const { data } = result;
-        if (data.status === "ready" && data.previewUrl) {
-          stopAll();
-          showReady(data.previewUrl);
-        } else if (data.status === "error") {
-          stopAll();
-          showError(data.message ?? "Sandbox initialization failed");
+        this.statusText = "Starting sandbox...";
+
+        const result = await actions.startSandbox({ sandboxId, host });
+
+        if (result.error) {
+          this._showError(result.error.message ?? "Failed to start sandbox");
+          return;
         }
-      } catch {
-        // Swallow poll errors — this is a fallback, not critical path
+
+        const { data } = result;
+
+        // Already ready (e.g. page refresh while container still alive)
+        if (data.status === "ready" && data.previewUrl) {
+          this._showReady(data.previewUrl);
+          return;
+        }
+
+        // Connect WebSocket — primary channel for progress updates
+        const wsEndpoint = data.wsEndpoint || `/api/ws?sandboxId=${sandboxId}`;
+        this._connectWebSocket(wsEndpoint, sandboxId, host);
+
+        // Schedule deferred polling fallback
+        this._schedulePollFallback(sandboxId, host);
+      } catch (err) {
+        console.error("Failed to start sandbox:", err);
+        this._showError("Failed to start sandbox. Please try again.");
       }
-    }, POLL_INTERVAL);
-  }
+    },
 
-  /** Connect WebSocket for real-time progress from server-side init */
-  function connectWebSocket(endpoint: string) {
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    ws = new WebSocket(
-      `${protocol}//${window.location.host}${endpoint}`,
-    );
+    _showReady(url: string) {
+      this._stopAll();
+      this.state = "ready";
+      this.previewUrl = url;
+    },
 
-    ws.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      // Only count substantive messages (progress/ready/error) as
-      // "delivered". The WS route may send a "connected" handshake ack
-      // which doesn't carry init state — if we counted that, polling
-      // would be suppressed even though WS hasn't actually delivered
-      // any progress info, and broadcasts from waitUntil may never arrive.
-      if (data.type === "progress" || data.type === "ready" || data.type === "error") {
-        wsHasDelivered = true;
+    _showError(message: string) {
+      this._stopAll();
+      this.state = "error";
+      this.errorMessage = message;
+    },
+
+    /** Clean up all timers and connections (called on ready or error). */
+    _stopAll() {
+      this._settled = true;
+      if (this._pollFallbackTimer) {
+        clearTimeout(this._pollFallbackTimer);
+        this._pollFallbackTimer = null;
       }
-      handleMessage(data);
-    };
+      if (this._pollTimer) {
+        clearInterval(this._pollTimer);
+        this._pollTimer = null;
+      }
+      if (this._ws) {
+        this._ws.onclose = null; // prevent auto-reconnect
+        this._ws.close();
+        this._ws = null;
+      }
+    },
 
-    ws.onerror = () => {
-      // Don't show error to user — the deferred poll fallback will
-      // cover this case if WS never recovers
-      console.warn("WebSocket error, relying on polling fallback");
-    };
+    /**
+     * Schedule the polling fallback with a delay.
+     * If WebSocket has delivered any message by the time the timer fires,
+     * polling is skipped entirely — WS is working fine.
+     */
+    _schedulePollFallback(sandboxId: string, host: string) {
+      this._pollFallbackTimer = setTimeout(() => {
+        if (this._settled || this._wsHasDelivered) return;
+        console.warn("WebSocket silent after timeout — starting poll fallback");
+        this._startPolling(sandboxId, host);
+      }, POLL_FALLBACK_DELAY);
+    },
 
-    ws.onclose = () => {
-      if (settled) return;
-      // Auto-reconnect — WS may close during container startup.
-      // 3s delay avoids tight reconnect loops.
-      setTimeout(() => connectWebSocket(endpoint), 3000);
-    };
-  }
+    /**
+     * Poll the startSandbox action to check for ready state.
+     * Self-cancels if WebSocket comes alive mid-poll.
+     */
+    _startPolling(sandboxId: string, host: string) {
+      if (this._pollTimer) return;
+      this._pollTimer = setInterval(async () => {
+        if (this._settled || this._wsHasDelivered) {
+          if (this._pollTimer) {
+            clearInterval(this._pollTimer);
+            this._pollTimer = null;
+          }
+          return;
+        }
+        try {
+          const result = await actions.startSandbox({ sandboxId, host });
+          if (result.error) return;
+          // The action returns a discriminated union but TS narrows too
+          // aggressively after the "ready" check. Use a loose type here
+          // since polling just needs status + optional fields.
+          const data = result.data as { status: string; previewUrl?: string; message?: string };
+          if (data.status === "ready" && data.previewUrl) {
+            this._showReady(data.previewUrl);
+          } else if (data.status === "error") {
+            this._showError(data.message ?? "Sandbox initialization failed");
+          }
+        } catch {
+          // Swallow poll errors — this is a fallback, not critical path
+        }
+      }, POLL_INTERVAL);
+    },
 
-  function handleMessage(data: Record<string, string>) {
-    switch (data.type) {
-      case "progress":
-        updateStep(data.step);
-        break;
-      case "ready":
-        stopAll();
-        showReady(data.previewUrl);
-        break;
-      case "error":
-        stopAll();
-        showError(data.message);
-        break;
-    }
-  }
+    /** Connect WebSocket for real-time progress from server-side init. */
+    _connectWebSocket(endpoint: string, sandboxId: string, host: string) {
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      this._ws = new WebSocket(
+        `${protocol}//${window.location.host}${endpoint}`,
+      );
 
-  function updateStatus(text: string) {
-    const statusEl = container?.querySelector(".status-text");
-    if (statusEl) statusEl.textContent = text;
-  }
+      this._ws.onmessage = (event: MessageEvent) => {
+        const data = JSON.parse(event.data);
+        // Only count substantive messages (progress/ready/error) as
+        // "delivered". The WS route may send a "connected" handshake ack
+        // which doesn't carry init state.
+        if (data.type === "progress" || data.type === "ready" || data.type === "error") {
+          this._wsHasDelivered = true;
+        }
+        this._handleMessage(data);
+      };
 
-  function updateStep(step: string) {
-    const statusEl = container?.querySelector(".status-text");
-    const stepEl = container?.querySelector(".step-indicator");
+      this._ws.onerror = () => {
+        console.warn("WebSocket error, relying on polling fallback");
+      };
 
-    if (statusEl) statusEl.textContent = getStepDescription(step);
-    if (stepEl) stepEl.textContent = step;
-  }
+      this._ws.onclose = () => {
+        if (this._settled) return;
+        // Auto-reconnect — WS may close during container startup.
+        setTimeout(() => this._connectWebSocket(endpoint, sandboxId, host), 3000);
+      };
+    },
 
-  function showReady(url: string) {
-    const loadingEl = container?.querySelector(
-      ".loading-state",
-    ) as HTMLElement | null;
-    const readyEl = container?.querySelector(
-      ".ready-state",
-    ) as HTMLElement | null;
-    const urlEl = container?.querySelector(".preview-url");
-    const iframeEl = container?.querySelector("iframe");
+    _handleMessage(data: Record<string, string>) {
+      switch (data.type) {
+        case "progress":
+          this.statusText = STEP_DESCRIPTIONS[data.step] ?? "Initializing...";
+          this.stepKey = data.step;
+          break;
+        case "ready":
+          this._showReady(data.previewUrl);
+          break;
+        case "error":
+          this._showError(data.message);
+          break;
+      }
+    },
+  }));
 
-    if (loadingEl) loadingEl.style.display = "none";
-    if (readyEl) readyEl.style.display = "block";
-    if (urlEl) urlEl.textContent = url;
-    if (iframeEl) iframeEl.src = url;
-  }
-
-  function showError(message: string) {
-    const loadingEl = container?.querySelector(
-      ".loading-state",
-    ) as HTMLElement | null;
-    const errorEl = container?.querySelector(
-      ".error-state",
-    ) as HTMLElement | null;
-    const errorMsgEl = container?.querySelector(".error-message");
-
-    if (loadingEl) loadingEl.style.display = "none";
-    if (errorEl) errorEl.style.display = "block";
-    if (errorMsgEl) errorMsgEl.textContent = message;
-  }
-
-  function getStepDescription(step: string) {
-    const steps: Record<string, string> = {
-      creating_workspace: "Creating workspace...",
-      writing_files: "Setting up Express server...",
-      starting_server: "Starting Express server...",
-      waiting_for_ready: "Waiting for server to be ready...",
-      exposing_port: "Configuring preview URL...",
-    };
-    return steps[step] || "Initializing...";
-  }
-
-  // Retry button handler
-  const retryBtn = container?.querySelector(".retry-btn");
-  if (retryBtn) {
-    retryBtn.addEventListener("click", () => {
-      location.reload();
-    });
-  }
-
-  // Auto-start
-  init();
+  Alpine.start();
 </script>
 
 <style>
+  [x-cloak] {
+    display: none !important;
+  }
+
   .sandbox-container {
     max-width: 1200px;
     margin: 0 auto;
