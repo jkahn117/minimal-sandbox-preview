@@ -17,7 +17,6 @@ export const sandboxManager = new SandboxManager({
   token: "express",
   portName: "express-server",
   sleepAfter: "5m",
-  ttlMs: 5 * 60 * 1000,
 
   async initialize({ sandbox, progress }) {
     progress("creating_workspace");
