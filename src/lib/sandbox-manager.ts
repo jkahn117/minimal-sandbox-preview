@@ -16,7 +16,7 @@
  * ```typescript
  * const manager = new SandboxManager({
  *   port: 3001,
- *   token: "express",
+ *   token: "vinext",
  *   sleepAfter: "5m",
  *   initialize: async (sandbox, { progress }) => {
  *     progress("writing_files");

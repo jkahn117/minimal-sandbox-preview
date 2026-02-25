@@ -10,19 +10,12 @@ RUN curl -fsSLk https://deb.nodesource.com/setup_22.x | bash - && \
 # Verify installations
 RUN node --version && pnpm --version
 
-# Expose port 3001 for Express app
+# Expose port 3001 for vinext app
 # NOTE: Port 3000 is reserved by Sandbox internal Bun server
 EXPOSE 3001
 
 # Set working directory
 WORKDIR /workspace
-
-# Copy and install dependencies during build
-COPY express-app/package.json express-app/pnpm-lock.yaml ./
-RUN pnpm install
-
-# Copy application code
-COPY express-app/server.js ./
 
 # The base image already has ENTRYPOINT configured
 # Don't override it - the sandbox binary will start automatically
