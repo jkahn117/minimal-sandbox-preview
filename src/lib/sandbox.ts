@@ -27,6 +27,14 @@ export const sandboxManager = new SandboxManager({
       targetDir: "/workspace",
     });
 
+    // Enable shamefully-hoist so transitive deps (e.g. react-server-dom-webpack,
+    // a dep of vinext) are hoisted to root node_modules. Without this, pnpm's
+    // strict linking prevents Vite's dep optimizer from resolving them from the
+    // example directory.
+    await sandbox.exec(
+      "echo 'shamefully-hoist=true' >> /workspace/.npmrc",
+    );
+
     progress("installing_dependencies");
     const installResult = await sandbox.exec("pnpm install", {
       cwd: "/workspace",
@@ -69,6 +77,12 @@ export const sandboxManager = new SandboxManager({
         "      },",
         "    }),",
         "  ],",
+        "  // Use a custom cacheDir so the outer Vite dev server (running the",
+        "  // Astro host app) doesn't intercept requests to the sandboxed Vite's",
+        "  // pre-bundled deps. The default 'node_modules/.vite' path is recognized",
+        "  // by the outer Vite and served from the host's local filesystem instead",
+        "  // of being proxied to the container.",
+        "  cacheDir: '.sandbox-vite',",
         "  server: {",
         "    host: '0.0.0.0',",
         "    hmr: {",
@@ -76,6 +90,10 @@ export const sandboxManager = new SandboxManager({
         "      protocol: 'wss',",
         "    },",
         "    allowedHosts: ['all'],",
+        "    watch: {",
+        "      usePolling: true,",
+        "      interval: 500,",
+        "    },",
         "  },",
         "});",
         "",

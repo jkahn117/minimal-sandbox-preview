@@ -1,0 +1,188 @@
+---
+/**
+ * Editable code panel that reads/writes files inside a running sandbox.
+ *
+ * Receives `sandboxId` and `filePath` as data attributes. Registers an
+ * Alpine.js component `editor` that:
+ *   1. Loads the file content on init via the `readFile` action
+ *   2. Displays it in a monospace textarea
+ *   3. Saves back to the sandbox via `writeFile` on Cmd+S / click
+ *
+ * Vite's HMR inside the sandbox picks up the file change and hot-reloads
+ * the preview iframe automatically — no coordination needed from this side.
+ */
+---
+
+<div
+  class="editor-wrapper"
+  x-data="editor"
+>
+  <div class="editor-toolbar">
+    <span class="file-path" x-text="filePath"></span>
+    <div class="editor-actions">
+      <span class="save-hint">Cmd+S to save</span>
+      <button
+        class="save-btn"
+        @click="saveFile()"
+        :disabled="saving || !dirty"
+      >
+        <span x-show="!saving" x-text="dirty ? 'Save' : 'Saved'"></span>
+        <span x-show="saving">Saving...</span>
+      </button>
+    </div>
+  </div>
+  <textarea
+    class="code-editor"
+    x-model="content"
+    @input="dirty = true"
+    @keydown.meta.s.prevent="saveFile()"
+    @keydown.ctrl.s.prevent="saveFile()"
+    spellcheck="false"
+    autocorrect="off"
+    autocapitalize="off"
+  ></textarea>
+</div>
+
+<script>
+  import Alpine from "alpinejs";
+  import { actions } from "astro:actions";
+
+  Alpine.data("editor", () => ({
+    sandboxId: "",
+    filePath: "",
+    content: "",
+    dirty: false,
+    saving: false,
+    loading: true,
+    error: "",
+
+    /**
+     * Called by the parent (SandboxComponent) once the sandbox is ready.
+     * Passes in the sandboxId and filePath, then loads the file content.
+     */
+    async load(sandboxId: string, filePath: string) {
+      this.sandboxId = sandboxId;
+      this.filePath = filePath;
+      this.loading = true;
+      this.error = "";
+
+      try {
+        const result = await actions.readFile({ sandboxId, filePath });
+        if (result.error) {
+          this.error = result.error.message;
+          return;
+        }
+        this.content = result.data.content;
+        this.dirty = false;
+      } catch (err) {
+        this.error = err instanceof Error ? err.message : "Failed to load file";
+      } finally {
+        this.loading = false;
+      }
+    },
+
+    async saveFile() {
+      if (this.saving || !this.dirty) return;
+      this.saving = true;
+      try {
+        const result = await actions.writeFile({
+          sandboxId: this.sandboxId,
+          filePath: this.filePath,
+          content: this.content,
+        });
+        if (result.error) {
+          console.error("Failed to save:", result.error.message);
+          return;
+        }
+        this.dirty = false;
+      } catch (err) {
+        console.error("Failed to save:", err);
+      } finally {
+        this.saving = false;
+      }
+    },
+  }));
+</script>
+
+<style>
+  .editor-wrapper {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+  }
+
+  .editor-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: #252526;
+    color: #ccc;
+    padding: 6px 12px;
+    font-family: monospace;
+    font-size: 13px;
+    border-bottom: 1px solid #333;
+    flex-shrink: 0;
+  }
+
+  .file-path {
+    color: #8bc34a;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .editor-actions {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-shrink: 0;
+  }
+
+  .save-hint {
+    color: #666;
+    font-size: 12px;
+  }
+
+  .save-btn {
+    padding: 3px 14px;
+    font-size: 13px;
+    font-family: monospace;
+    cursor: pointer;
+    background: #2196f3;
+    color: white;
+    border: none;
+    border-radius: 3px;
+    min-width: 65px;
+  }
+
+  .save-btn:hover:not(:disabled) {
+    background: #1976d2;
+  }
+
+  .save-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  .code-editor {
+    flex: 1;
+    resize: none;
+    border: none;
+    outline: none;
+    padding: 16px;
+    font-family: "SF Mono", "Fira Code", "Fira Mono", Menlo, Consolas, monospace;
+    font-size: 13px;
+    line-height: 1.6;
+    background: #1e1e1e;
+    color: #d4d4d4;
+    tab-size: 2;
+    white-space: pre;
+    overflow: auto;
+    box-sizing: border-box;
+    min-height: 0;
+  }
+
+  .code-editor:focus {
+    outline: none;
+  }
+</style>
