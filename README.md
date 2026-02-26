@@ -321,8 +321,6 @@ The `setTimeout` lives in the Worker isolate. If the isolate is evicted (~30s of
 ├── wrangler.jsonc                  # Worker, DO, containers (max_instances:5), routes
 ├── worker-configuration.d.ts       # Auto-generated types (wrangler types)
 ├── tsconfig.json
-├── scripts/
-│   └── patch-deploy-config.mjs     # Post-build: injects routes/workers_dev into deploy config
 ├── sandbox/
 │   ├── Dockerfile                  # cloudflare/sandbox:0.7.4 base + Node 22 + pnpm
 │   └── express-app/
@@ -457,10 +455,10 @@ The first serves the main page. The second catches preview URL subdomains so `pr
 
 ```bash
 pnpm deploy
-# Runs: wrangler types && astro build && node scripts/patch-deploy-config.mjs && wrangler deploy
+# Runs: wrangler types && astro build && wrangler deploy
 ```
 
-The post-build patch (`scripts/patch-deploy-config.mjs`) is necessary because `astro build` generates `dist/server/wrangler.json` which wrangler uses for deploy, but the Astro adapter **drops `routes` and `workers_dev`** from the generated config. Without the patch, the worker deploys but isn't attached to the custom domain.
+`astro build` now carries `routes` and `workers_dev` into `dist/server/wrangler.json`, so the deploy flow no longer needs post-build patching.
 
 ## Scripts
 
@@ -470,7 +468,7 @@ The post-build patch (`scripts/patch-deploy-config.mjs`) is necessary because `a
 | `pnpm build`   | Generate types + build for production                |
 | `pnpm preview` | Preview production build locally (workerd)           |
 | `pnpm types`   | Regenerate `worker-configuration.d.ts`               |
-| `pnpm deploy`  | Build + patch + deploy to Cloudflare (production)    |
+| `pnpm deploy`  | Build + deploy to Cloudflare (production)            |
 
 ## Known issues and workarounds
 
@@ -489,10 +487,6 @@ The `fetch_iterable_type_support` flag (auto-enabled at compat date `2026-02-19`
 ### WebSocket broadcasts from `waitUntil` are unreliable
 
 Broadcasts from `waitUntil` don't always reach WebSocket clients (cross-I/O-context issue in workerd). The `SandboxPreview` client has a deferred polling fallback that activates after 5 seconds of WS silence. This is a known limitation, not a bug in this codebase.
-
-### Post-build config patching
-
-The Astro Cloudflare adapter drops `routes` and `workers_dev` from the generated deploy config. The `scripts/patch-deploy-config.mjs` script injects them back after `astro build`. This is fragile — revisit when Astro v6 reaches GA.
 
 ### `proxyToSandbox()` can return non-Response truthy values
 
