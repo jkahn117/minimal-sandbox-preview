@@ -153,6 +153,18 @@ export class SandboxManager {
     const state = this.getOrCreate(sandboxId);
     const wsEndpoint = this.wsEndpoint(sandboxId);
 
+    if (
+      state.isInitialized &&
+      state.previewUrl &&
+      !this.hasExpectedToken(state.previewUrl)
+    ) {
+      console.warn(
+        `[sandbox:${sandboxId}] Cached preview URL token mismatch, forcing re-init: ${state.previewUrl}`,
+      );
+      state.isInitialized = false;
+      state.previewUrl = null;
+    }
+
     if (state.isInitialized && state.previewUrl) {
       return { status: "ready", previewUrl: state.previewUrl, wsEndpoint };
     }
@@ -351,12 +363,21 @@ export class SandboxManager {
   ): Promise<string | null> {
     try {
       const ports = await sandbox.getExposedPorts(host);
-      const existing = ports.find((p) => p.port === this.opts.port);
+      const existing = ports.find(
+        (p) => p.port === this.opts.port && this.hasExpectedToken(p.url),
+      );
       if (existing) {
         console.log(
           `[sandbox:${sandboxId}] Port ${this.opts.port} already exposed, reusing: ${existing.url}`,
         );
         return existing.url;
+      }
+
+      const mismatched = ports.find((p) => p.port === this.opts.port);
+      if (mismatched) {
+        console.warn(
+          `[sandbox:${sandboxId}] Port ${this.opts.port} exposed with mismatched token, ignoring stale URL: ${mismatched.url}`,
+        );
       }
     } catch (err) {
       // Container may not be running yet — proceed with init
@@ -396,15 +417,34 @@ export class SandboxManager {
         // Port was exposed between our check and this call — recover
         // by fetching the existing URL.
         const ports = await sandbox.getExposedPorts(host);
-        const existing = ports.find((p) => p.port === this.opts.port);
+        const existing = ports.find(
+          (p) => p.port === this.opts.port && this.hasExpectedToken(p.url),
+        );
         if (existing) {
           console.log(
             `[sandbox:${sandboxId}] Port already exposed (race), reusing: ${existing.url}`,
           );
           return existing.url;
         }
+
+        const mismatched = ports.find((p) => p.port === this.opts.port);
+        if (mismatched) {
+          throw new Error(
+            `Port ${this.opts.port} is already exposed with a different token (${mismatched.url}). Expected token "${this.opts.token}". Use a fresh sandboxId.`,
+          );
+        }
       }
       throw err;
+    }
+  }
+
+  private hasExpectedToken(previewUrl: string): boolean {
+    try {
+      const hostname = new URL(previewUrl).hostname;
+      const firstLabel = hostname.split(".")[0] ?? "";
+      return firstLabel.endsWith(`-${this.opts.token}`);
+    } catch {
+      return false;
     }
   }
 }

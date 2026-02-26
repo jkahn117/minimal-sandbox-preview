@@ -21,7 +21,7 @@ generated.routes = [
     custom_domain: true,
   },
   {
-    pattern: "*.sandbox.cfsa.dev",
+    pattern: "*.sandbox.cfsa.dev/*",
     zone_name: "cfsa.dev",
   },
 ];

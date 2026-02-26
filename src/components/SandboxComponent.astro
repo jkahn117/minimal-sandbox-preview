@@ -44,6 +44,16 @@ const editableFile = "/workspace/app/src/App.vue";
 
   <!-- Ready state: editor + preview -->
   <div class="ready-state" x-show="state === 'ready'" x-cloak>
+    <div class="preview-url-bar">
+      <span class="preview-url-label">Preview URL:</span>
+      <a
+        class="preview-url-link"
+        :href="previewUrl"
+        x-text="previewUrl"
+        target="_blank"
+        rel="noopener noreferrer"
+      ></a>
+    </div>
     <div class="split-pane">
       <div class="editor-pane" x-ref="editorPane">
         <EditorPane />
@@ -142,7 +152,10 @@ const editableFile = "/workspace/app/src/App.vue";
         // $nextTick ensures the editor DOM is visible before we call load().
         this.$nextTick(() => {
           const editorEl = (this.$refs as Record<string, HTMLElement>).editorPane;
-          const editorData = Alpine.$data(editorEl?.querySelector("[x-data='editor']") as HTMLElement);
+          const editorData: { load?: (id: string, filePath: string) => void } =
+            Alpine.$data(
+              editorEl?.querySelector("[x-data='editor']") as HTMLElement,
+            ) as unknown as { load?: (id: string, filePath: string) => void };
           if (editorData?.load) {
             editorData.load(sandboxId, editableFile);
           }
@@ -216,6 +229,36 @@ const editableFile = "/workspace/app/src/App.vue";
   }
 
   /* Split pane */
+  .preview-url-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 12px;
+    padding: 10px 12px;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    background: #fff;
+    font-family: monospace;
+    font-size: 13px;
+  }
+
+  .preview-url-label {
+    color: #333;
+    flex-shrink: 0;
+  }
+
+  .preview-url-link {
+    color: #1565c0;
+    text-decoration: none;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .preview-url-link:hover {
+    text-decoration: underline;
+  }
+
   .split-pane {
     display: flex;
     border: 1px solid #333;
