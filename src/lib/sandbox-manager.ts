@@ -323,7 +323,7 @@ export class SandboxManager {
       state.isInitializing = false;
       state.currentStep = "";
       this.broadcast(state, { type: "error", message: state.initError });
-      console.error(`[sandbox:${sandboxId}] Failed to initialize:`, error);
+      console.error(`Sandbox ${sandboxId} initialization failed:`, error);
     }
   }
 

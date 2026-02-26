@@ -1,112 +1,114 @@
 /**
  * App-specific sandbox configuration.
  *
- * Creates a SandboxManager instance with this project's initialization
- * logic (vinext server setup). The manager handles all lifecycle
- * boilerplate: state tracking, TTL cleanup, WS broadcasts, isolate
- * eviction recovery, and PortAlreadyExposedError handling.
+ * The Docker image (sandbox/Dockerfile) ships with a complete Vue + Vite
+ * app pre-installed at /workspace/app — package.json, vite.config.ts,
+ * index.html, main.ts, and node_modules are all baked in.
  *
- * Other projects using @cloudflare/sandbox would create their own
- * instance with different `initialize` logic.
+ * At runtime we only need to:
+ *   1. Write App.vue (the editable file)
+ *   2. Start the Vite dev server
+ *   3. Wait for it to respond
+ *
+ * This keeps container startup fast with zero network dependency.
  */
 
 import { SandboxManager } from "./sandbox-manager";
 
+/** The directory inside the container where the Vue app lives. */
+const APP_DIR = "/workspace/app";
+
+/** The file shown in the editor pane. */
+export const EDITABLE_FILE = `${APP_DIR}/src/App.vue`;
+const VITE_CONFIG_FILE = `${APP_DIR}/vite.config.ts`;
+
+/** Default content for App.vue (matches sandbox/app/src/App.vue). */
+const DEFAULT_APP_VUE = `<script setup lang="ts">
+import { ref } from "vue";
+
+const count = ref(0);
+</script>
+
+<template>
+  <div style="font-family: sans-serif; max-width: 600px; margin: 40px auto; text-align: center;">
+    <h1>Hello from the Sandbox!</h1>
+    <p>Edit this component in the editor and save to see HMR in action.</p>
+    <button @click="count++" style="font-size: 1.2rem; padding: 8px 20px; cursor: pointer;">
+      Count: {{ count }}
+    </button>
+  </div>
+</template>
+`;
+
+const DEFAULT_VITE_CONFIG = [
+  "// @ts-nocheck",
+  'import { defineConfig } from "vite";',
+  'import vue from "@vitejs/plugin-vue";',
+  "",
+  "export default defineConfig({",
+  "  plugins: [",
+  "    vue(),",
+  "    {",
+  '      name: "the-watcher",',
+  "      configureServer(server) {",
+  '        server.middlewares.use("/__sandbox_hmr", (req, res, next) => {',
+  "          if (!req.url) {",
+  "            next();",
+  "            return;",
+  "          }",
+  "",
+  '          const url = new URL(req.url, "http://localhost");',
+  '          const filePath = url.searchParams.get("file");',
+  "          const clientCount =",
+  "            ((server.ws as unknown as { clients?: Set<unknown> }).clients?.size ??",
+  "              0);",
+  '          server.ws.send({ type: "full-reload" });',
+  "",
+  "          res.statusCode = 200;",
+  '          res.setHeader("content-type", "application/json");',
+  "          res.end(JSON.stringify({ ok: true, filePath, clients: clientCount }));",
+  "        });",
+  "      },",
+  "    },",
+  "  ],",
+  '  cacheDir: ".sandbox-vite",',
+  "  server: {",
+  '    host: "0.0.0.0",',
+  "    allowedHosts: true,",
+  "    watch: {",
+  "      usePolling: true,",
+  "      interval: 500,",
+  "    },",
+  "  },",
+  "});",
+  "",
+].join("\n");
+
 export const sandboxManager = new SandboxManager({
   port: 3001,
-  token: "vinext",
-  portName: "vinext-server",
+  token: "vuehmr",
+  portName: "vite-dev",
   sleepAfter: "5m",
 
   async initialize({ sandbox, progress }) {
-    progress("creating_workspace");
-    await sandbox.mkdir("/workspace", { recursive: true });
+    // Write the editable file (image ships a copy, but we write it fresh
+    // so the content always matches what the editor will show).
+    progress("writing_files");
+    await sandbox.writeFile(EDITABLE_FILE, DEFAULT_APP_VUE);
+    await sandbox.writeFile(VITE_CONFIG_FILE, DEFAULT_VITE_CONFIG);
 
-    progress("cloning_repo");
-    await sandbox.gitCheckout("https://github.com/cloudflare/vinext", {
-      targetDir: "/workspace",
-    });
-
-    // Enable shamefully-hoist so transitive deps (e.g. react-server-dom-webpack,
-    // a dep of vinext) are hoisted to root node_modules. Without this, pnpm's
-    // strict linking prevents Vite's dep optimizer from resolving them from the
-    // example directory.
-    await sandbox.exec(
-      "echo 'shamefully-hoist=true' >> /workspace/.npmrc",
-    );
-
-    progress("installing_dependencies");
-    const installResult = await sandbox.exec("pnpm install", {
-      cwd: "/workspace",
-      stream: true,
-      onOutput: (_stream, data) => progress(`installing: ${data.trim()}`),
-    });
-    if (!installResult.success) {
-      throw new Error(
-        `pnpm install failed (exit ${installResult.exitCode}): ${installResult.stderr.slice(0, 500)}`,
-      );
-    }
-
-    progress("building_vinext");
-    const buildResult = await sandbox.exec("pnpm run build", {
-      cwd: "/workspace/packages/vinext",
-      stream: true,
-      onOutput: (_stream, data) => progress(`building: ${data.trim()}`),
-    });
-    if (!buildResult.success) {
-      throw new Error(
-        `vinext build failed (exit ${buildResult.exitCode}): ${buildResult.stderr.slice(0, 500)}`,
-      );
-    }
-
-    progress("patching_vite_config");
-    await sandbox.writeFile(
-      "/workspace/examples/app-router-cloudflare/vite.config.ts",
-      [
-        'import { defineConfig } from "vite";',
-        'import vinext from "vinext";',
-        'import { cloudflare } from "@cloudflare/vite-plugin";',
-        "",
-        "export default defineConfig({",
-        "  plugins: [",
-        "    vinext(),",
-        "    cloudflare({",
-        "      viteEnvironment: {",
-        '        name: "rsc",',
-        '        childEnvironments: ["ssr"],',
-        "      },",
-        "    }),",
-        "  ],",
-        "  // Use a custom cacheDir so the outer Vite dev server (running the",
-        "  // Astro host app) doesn't intercept requests to the sandboxed Vite's",
-        "  // pre-bundled deps. The default 'node_modules/.vite' path is recognized",
-        "  // by the outer Vite and served from the host's local filesystem instead",
-        "  // of being proxied to the container.",
-        "  cacheDir: '.sandbox-vite',",
-        "  server: {",
-        "    host: '0.0.0.0',",
-        "    hmr: {",
-        "      clientPort: 443,",
-        "      protocol: 'wss',",
-        "    },",
-        "    allowedHosts: ['all'],",
-        "    watch: {",
-        "      usePolling: true,",
-        "      interval: 500,",
-        "    },",
-        "  },",
-        "});",
-        "",
-      ].join("\n"),
-    );
-
+    // Start the Vite dev server
     progress("starting_server");
-    await sandbox.startProcess("pnpm dev --port 3001", {
-      processId: "vinext-dev",
-      cwd: "/workspace/examples/app-router-cloudflare",
+    await sandbox.startProcess("npx vite --port 3001", {
+      processId: "vite-dev",
+      cwd: APP_DIR,
       env: {
         PORT: "3001",
         NODE_ENV: "development",
+        // Ensure chokidar uses polling (env var fallback in case
+        // the vite.config.ts watch option isn't respected).
+        CHOKIDAR_USEPOLLING: "true",
+        CHOKIDAR_INTERVAL: "500",
       },
     });
 
@@ -114,7 +116,7 @@ export const sandboxManager = new SandboxManager({
     await new Promise((resolve) => setTimeout(resolve, 2000));
 
     // Bail early if the process already exited
-    const procStatus = await sandbox.getProcess("vinext-dev");
+    const procStatus = await sandbox.getProcess("vite-dev");
     if (
       procStatus &&
       (procStatus.status === "completed" ||
@@ -124,17 +126,18 @@ export const sandboxManager = new SandboxManager({
     ) {
       const procLogs = await procStatus.getLogs();
       throw new Error(
-        `vinext dev exited immediately (exit ${procStatus.exitCode}): ${procLogs.stderr?.slice(0, 500) ?? procLogs.stdout?.slice(0, 500) ?? "no output"}`,
+        `vite dev exited immediately (exit ${procStatus.exitCode}): ${procLogs.stderr?.slice(0, 500) ?? procLogs.stdout?.slice(0, 500) ?? "no output"}`,
       );
     }
 
+    // Poll until the server responds
     progress("waiting_for_ready");
     let isReady = false;
     for (let i = 0; i < 15; i++) {
       await new Promise((resolve) => setTimeout(resolve, 3000));
 
       // Check if the process crashed mid-loop
-      const liveProc = await sandbox.getProcess("vinext-dev");
+      const liveProc = await sandbox.getProcess("vite-dev");
       if (
         liveProc &&
         (liveProc.status === "completed" ||
@@ -144,7 +147,7 @@ export const sandboxManager = new SandboxManager({
       ) {
         const crashLogs = await liveProc.getLogs();
         throw new Error(
-          `vinext dev crashed (exit ${liveProc.exitCode}): ${crashLogs.stderr?.slice(0, 500) ?? crashLogs.stdout?.slice(0, 500) ?? "no output"}`,
+          `vite dev crashed (exit ${liveProc.exitCode}): ${crashLogs.stderr?.slice(0, 500) ?? crashLogs.stdout?.slice(0, 500) ?? "no output"}`,
         );
       }
 

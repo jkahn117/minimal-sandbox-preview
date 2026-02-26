@@ -1,20 +1,21 @@
 FROM docker.io/cloudflare/sandbox:0.7.4
 
-# Install Node.js 22.x with SSL verification disabled for local dev
-RUN curl -fsSLk https://deb.nodesource.com/setup_22.x | bash - && \
-    apt-get update && \
-    apt-get install -y nodejs && \
-    npm install -g pnpm && \
-    rm -rf /var/lib/apt/lists/*
+# Pre-bake the Vue + Vite app so containers start instantly with no
+# network dependency. Only App.vue is written at runtime (the editable file).
 
-# Verify installations
-RUN node --version && pnpm --version
+WORKDIR /workspace/app
 
-# Expose port 3001 for vinext app
+# Copy package.json first for layer caching
+COPY app/package.json ./
+RUN npm install
+
+# Copy the rest of the app scaffold
+COPY app/ ./
+
+# Expose port 3001 for the Vite dev server
 # NOTE: Port 3000 is reserved by Sandbox internal Bun server
 EXPOSE 3001
 
-# Set working directory
 WORKDIR /workspace
 
 # The base image already has ENTRYPOINT configured

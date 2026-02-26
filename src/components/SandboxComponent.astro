@@ -10,9 +10,9 @@ const { sandboxId, host } = Astro.props;
 
 /**
  * The file inside the sandbox that the editor will load and save.
- * This is the main page component of the vinext app-router-cloudflare example.
+ * This is the root Vue component of the scaffolded app.
  */
-const editableFile = "/workspace/examples/app-router-cloudflare/app/page.tsx";
+const editableFile = "/workspace/app/src/App.vue";
 ---
 
 <!--
@@ -78,11 +78,9 @@ const editableFile = "/workspace/examples/app-router-cloudflare/app/page.tsx";
 
   const STEP_DESCRIPTIONS: Record<string, string> = {
     creating_workspace: "Creating workspace...",
-    cloning_repo: "Cloning vinext repository...",
+    writing_files: "Scaffolding Vue app...",
     installing_dependencies: "Installing dependencies...",
-    building_vinext: "Building vinext package...",
-    patching_vite_config: "Configuring dev server...",
-    starting_server: "Starting vinext dev server...",
+    starting_server: "Starting Vite dev server...",
     waiting_for_ready: "Waiting for server to be ready...",
     exposing_port: "Configuring preview URL...",
   };
@@ -110,8 +108,21 @@ const editableFile = "/workspace/examples/app-router-cloudflare/app/page.tsx";
     errorMessage: "",
 
     _preview: null as SandboxPreview | null,
+    _onPreviewReload: null as ((event: Event) => void) | null,
+
+    reloadPreview() {
+      if (!this.previewUrl) return;
+      const url = new URL(this.previewUrl);
+      url.searchParams.set("_ts", Date.now().toString());
+      this.previewUrl = url.toString();
+    },
 
     init() {
+      this._onPreviewReload = () => {
+        this.reloadPreview();
+      };
+      window.addEventListener("sandbox:preview-reload", this._onPreviewReload);
+
       const preview = new SandboxPreview({
         start: callAction,
         poll: callAction,
@@ -149,6 +160,9 @@ const editableFile = "/workspace/examples/app-router-cloudflare/app/page.tsx";
 
     destroy() {
       this._preview?.destroy();
+      if (this._onPreviewReload) {
+        window.removeEventListener("sandbox:preview-reload", this._onPreviewReload);
+      }
     },
   }));
 

@@ -91,12 +91,28 @@
           content: this.content,
         });
         if (result.error) {
-          console.error("Failed to save:", result.error.message);
+          console.error("Editor save failed:", result.error.message);
           return;
         }
+
+        const writeResult = result.data as unknown as
+          | { hmrNotified?: boolean; hmrClients?: number }
+          | undefined;
+        const hmrClients = writeResult?.hmrClients ?? 0;
+        if (!writeResult?.hmrNotified || hmrClients === 0) {
+          window.dispatchEvent(
+            new CustomEvent("sandbox:preview-reload", {
+              detail: {
+                filePath: this.filePath,
+                reason: "hmr-unavailable",
+              },
+            }),
+          );
+        }
+
         this.dirty = false;
       } catch (err) {
-        console.error("Failed to save:", err);
+        console.error("Editor save failed:", err);
       } finally {
         this.saving = false;
       }
