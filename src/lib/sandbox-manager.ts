@@ -16,7 +16,7 @@
  * ```typescript
  * const manager = new SandboxManager({
  *   port: 3001,
- *   token: "express",
+ *   token: "vinext",
  *   sleepAfter: "5m",
  *   initialize: async (sandbox, { progress }) => {
  *     progress("writing_files");
@@ -323,7 +323,7 @@ export class SandboxManager {
       state.isInitializing = false;
       state.currentStep = "";
       this.broadcast(state, { type: "error", message: state.initError });
-      console.error(`[sandbox:${sandboxId}] Failed to initialize:`, error);
+      console.error(`Sandbox ${sandboxId} initialization failed:`, error);
     }
   }
 

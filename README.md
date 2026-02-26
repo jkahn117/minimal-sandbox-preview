@@ -1,8 +1,20 @@
 # Cloudflare Sandbox SDK Minimal Example
 
-A working demonstration of Cloudflare's Sandbox SDK using **Astro v6 beta** with the Cloudflare adapter. Runs an Express.js server inside an isolated container with real-time WebSocket progress updates during initialization.
+A working demonstration of Cloudflare's Sandbox SDK using **Astro v6 beta** with the Cloudflare adapter. Runs a Vue + Vite dev server inside an isolated container, with real-time WebSocket progress updates during initialization and a live editor/preview workflow.
 
 Live at: **https://sandbox.cfsa.dev**
+
+## Hot reload in preview
+
+The editor writes directly to the running sandbox filesystem (for example,
+`/workspace/app/src/App.vue`). After each successful write, the server action
+calls an internal Vite endpoint (`/__sandbox_hmr`) inside the container to
+trigger a reload event over Vite's HMR websocket.
+
+If HMR clients are unavailable, the UI falls back to a deterministic iframe
+refresh by updating the preview URL with a cache-busting query parameter. This
+keeps preview updates reliable even when websocket HMR is temporarily
+unavailable.
 
 ## Reusable libraries
 

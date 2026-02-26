@@ -27,7 +27,7 @@ export const onRequest = defineMiddleware(async ({ request }, next) => {
         return proxyResponse;
       }
     } catch (err) {
-      console.error("[middleware] proxyToSandbox error:", err);
+      console.error("Sandbox proxy middleware error:", err);
     }
   }
 

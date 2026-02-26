@@ -1,46 +1,31 @@
 ---
+import EditorPane from "./EditorPane.astro";
+
 interface Props {
   sandboxId: string;
   host: string;
 }
 
 const { sandboxId, host } = Astro.props;
+
+/**
+ * The file inside the sandbox that the editor will load and save.
+ * This is the root Vue component of the scaffolded app.
+ */
+const editableFile = "/workspace/app/src/App.vue";
 ---
 
 <!--
-  Client-side sandbox initialization and progress tracking.
+  Sandbox lifecycle + split-pane HMR demo.
 
-  ## Progress strategy: WebSocket primary, polling as deferred fallback
+  Three states:
+    loading  — spinner + progress text while container initializes
+    ready    — code editor (left) + live preview iframe (right)
+    error    — error message + retry button
 
-  Sandbox initialization runs server-side inside `waitUntil()` and takes
-  30-40s. The client needs to know when it's done. Two channels exist:
-
-  1. **WebSocket (primary)** — Connects to `/api/ws?sandboxId=...` for
-     real-time progress broadcasts from the server. This is the preferred
-     channel and delivers step-by-step updates (creating workspace,
-     writing files, starting server, etc.).
-
-  2. **Polling (deferred fallback)** — Calls `actions.startSandbox()`
-     periodically to check the server-side state. Only activates if
-     WebSocket has not delivered ANY message after 10 seconds.
-
-  Why polling exists at all: WebSocket broadcasts from `waitUntil()`
-  don't reliably reach clients in workerd. The init runs in a detached
-  promise (kept alive by `waitUntil`), and the WS connections are
-  registered in a different request context. In practice, WS messages
-  sometimes never arrive. Polling covers this gap.
-
-  Why polling is deferred (not immediate): The original implementation
-  polled every 3s starting immediately alongside WebSocket. This caused
-  duplicate paired POST requests — the initial action call takes ~3s,
-  and the first poll tick fires nearly simultaneously. With 5 concurrent
-  containers allowed (max_instances: 5), this traffic was wasteful and
-  made debugging harder. See decision 19 in _plan/4. decisions.md.
-
-  Flow:
-    init() → action call → connect WS → schedule fallback (5s)
-      ├─ WS delivers progress/ready/error → wsHasDelivered=true → polling skipped
-      └─ WS silent after 5s → poll every 5s → self-cancels if WS wakes
+  The EditorPane component handles file read/write independently.
+  When the user saves, Vite HMR inside the container picks up the
+  change and hot-reloads the iframe automatically.
 -->
 
 <div
@@ -48,18 +33,32 @@ const { sandboxId, host } = Astro.props;
   x-data="sandbox"
   data-sandbox-id={sandboxId}
   data-host={host}
+  data-editable-file={editableFile}
 >
+  <!-- Loading state -->
   <div class="loading-state" x-show="state === 'loading'">
     <div class="spinner"></div>
     <div class="status-text" x-text="statusText"></div>
     <div class="step-indicator" x-text="stepKey"></div>
   </div>
 
+  <!-- Ready state: editor + preview -->
   <div class="ready-state" x-show="state === 'ready'" x-cloak>
-    <div class="preview-url" x-text="previewUrl"></div>
-    <iframe title="Sandbox Preview" loading="lazy" :src="previewUrl"></iframe>
+    <div class="split-pane">
+      <div class="editor-pane" x-ref="editorPane">
+        <EditorPane />
+      </div>
+      <div class="preview-pane">
+        <iframe
+          title="Sandbox Preview"
+          loading="lazy"
+          :src="previewUrl"
+        ></iframe>
+      </div>
+    </div>
   </div>
 
+  <!-- Error state -->
   <div class="error-state" x-show="state === 'error'" x-cloak>
     <div class="error-message" x-text="errorMessage"></div>
     <button class="retry-btn" @click="location.reload()">Retry</button>
@@ -69,8 +68,9 @@ const { sandboxId, host } = Astro.props;
 <script>
   /**
    * Thin Alpine.js binding layer. All WS/polling logic lives in
-   * SandboxPreview (src/lib/sandbox-preview.ts). This script just
-   * wires the library's events to Alpine's reactive state.
+   * SandboxPreview (src/lib/sandbox-preview.ts). This script wires
+   * the library's events to Alpine's reactive state, and triggers
+   * the EditorPane to load the file once the sandbox is ready.
    */
   import Alpine from "alpinejs";
   import { actions } from "astro:actions";
@@ -78,8 +78,9 @@ const { sandboxId, host } = Astro.props;
 
   const STEP_DESCRIPTIONS: Record<string, string> = {
     creating_workspace: "Creating workspace...",
-    writing_files: "Setting up Express server...",
-    starting_server: "Starting Express server...",
+    writing_files: "Scaffolding Vue app...",
+    installing_dependencies: "Installing dependencies...",
+    starting_server: "Starting Vite dev server...",
     waiting_for_ready: "Waiting for server to be ready...",
     exposing_port: "Configuring preview URL...",
   };
@@ -87,6 +88,7 @@ const { sandboxId, host } = Astro.props;
   const containerEl = document.querySelector<HTMLElement>(".sandbox-container");
   const sandboxId = containerEl?.dataset.sandboxId ?? "";
   const host = containerEl?.dataset.host ?? window.location.host;
+  const editableFile = containerEl?.dataset.editableFile ?? "";
 
   /** Adapt Astro Actions' result shape to what SandboxPreview expects. */
   const callAction = async (): Promise<ActionResult> => {
@@ -94,8 +96,6 @@ const { sandboxId, host } = Astro.props;
     if (result.error) {
       return { error: { message: result.error.message } };
     }
-    // Widen the discriminated union — the library only needs status +
-    // optional previewUrl/wsEndpoint/message fields.
     const data = result.data as ActionResult["data"];
     return { data };
   };
@@ -108,21 +108,45 @@ const { sandboxId, host } = Astro.props;
     errorMessage: "",
 
     _preview: null as SandboxPreview | null,
+    _onPreviewReload: null as ((event: Event) => void) | null,
+
+    reloadPreview() {
+      if (!this.previewUrl) return;
+      const url = new URL(this.previewUrl);
+      url.searchParams.set("_ts", Date.now().toString());
+      this.previewUrl = url.toString();
+    },
 
     init() {
+      this._onPreviewReload = () => {
+        this.reloadPreview();
+      };
+      window.addEventListener("sandbox:preview-reload", this._onPreviewReload);
+
       const preview = new SandboxPreview({
         start: callAction,
         poll: callAction,
       });
 
       preview.on("progress", ({ step }) => {
-        this.statusText = STEP_DESCRIPTIONS[step] ?? "Initializing...";
-        this.stepKey = step;
+        const baseStep = step.includes(":") ? step.split(":")[0].trim() : step;
+        this.statusText = STEP_DESCRIPTIONS[baseStep] ?? step;
+        this.stepKey = baseStep;
       });
 
       preview.on("ready", ({ previewUrl }) => {
         this.state = "ready";
         this.previewUrl = previewUrl;
+
+        // Tell the EditorPane to load the file.
+        // $nextTick ensures the editor DOM is visible before we call load().
+        this.$nextTick(() => {
+          const editorEl = (this.$refs as Record<string, HTMLElement>).editorPane;
+          const editorData = Alpine.$data(editorEl?.querySelector("[x-data='editor']") as HTMLElement);
+          if (editorData?.load) {
+            editorData.load(sandboxId, editableFile);
+          }
+        });
       });
 
       preview.on("error", ({ message }) => {
@@ -136,6 +160,9 @@ const { sandboxId, host } = Astro.props;
 
     destroy() {
       this._preview?.destroy();
+      if (this._onPreviewReload) {
+        window.removeEventListener("sandbox:preview-reload", this._onPreviewReload);
+      }
     },
   }));
 
@@ -148,10 +175,11 @@ const { sandboxId, host } = Astro.props;
   }
 
   .sandbox-container {
-    max-width: 1200px;
+    max-width: 1400px;
     margin: 0 auto;
   }
 
+  /* Loading */
   .loading-state {
     background: white;
     border: 1px solid #ddd;
@@ -176,12 +204,8 @@ const { sandboxId, host } = Astro.props;
   }
 
   @keyframes spin {
-    0% {
-      transform: rotate(0deg);
-    }
-    100% {
-      transform: rotate(360deg);
-    }
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
   }
 
   .step-indicator {
@@ -191,23 +215,36 @@ const { sandboxId, host } = Astro.props;
     font-family: monospace;
   }
 
-  .preview-url {
-    background: #e3f2fd;
-    padding: 10px;
+  /* Split pane */
+  .split-pane {
+    display: flex;
+    border: 1px solid #333;
     border-radius: 4px;
-    margin-bottom: 20px;
-    font-family: monospace;
-    word-break: break-all;
+    overflow: hidden;
+    height: 650px;
   }
 
-  iframe {
+  .editor-pane {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .preview-pane {
+    flex: 1;
+    min-width: 0;
+    border-left: 2px solid #333;
+  }
+
+  .preview-pane iframe {
     width: 100%;
-    height: 600px;
-    border: 1px solid #ddd;
-    border-radius: 4px;
+    height: 100%;
+    border: none;
     background: white;
   }
 
+  /* Error */
   .error-state {
     text-align: center;
     padding: 40px;
@@ -218,7 +255,7 @@ const { sandboxId, host } = Astro.props;
     margin-bottom: 20px;
   }
 
-  button {
+  .retry-btn {
     padding: 10px 20px;
     font-size: 16px;
     cursor: pointer;
@@ -228,7 +265,7 @@ const { sandboxId, host } = Astro.props;
     border-radius: 4px;
   }
 
-  button:hover {
+  .retry-btn:hover {
     background: #1976d2;
   }
 </style>
