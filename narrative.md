@@ -264,25 +264,18 @@ This prevents workerd from exposing `process` v2 entirely, so Astro
 never misdetects the runtime. It attacks the root cause rather than
 patching the symptom.
 
-## The deploy pipeline gap
+## The deploy pipeline update
 
 `astro build` generates `dist/server/wrangler.json`, which wrangler
-uses for deploy. The Astro Cloudflare adapter copies most fields from
-`wrangler.jsonc` into this generated config — bindings, containers,
-migrations — but drops `routes` and `workers_dev`. Without routes,
-`wrangler deploy` uploads the worker but doesn't attach it to the
-custom domain. The worker is unreachable.
+uses for deploy. In the current toolchain, the Astro Cloudflare adapter
+now carries `routes` and `workers_dev` through into that generated
+config, so deploy no longer requires a post-build patch script.
 
-The fix is a small Node script that runs between `astro build` and
-`wrangler deploy`, injecting the missing fields:
+Current deploy command:
 
 ```
-"deploy": "wrangler types && astro build && node scripts/patch-deploy-config.mjs && wrangler deploy"
+"deploy": "wrangler types && astro build && wrangler deploy"
 ```
-
-Fragile, yes. If the adapter starts carrying routes through, the script
-becomes a no-op that should be removed. But until Astro v6 reaches GA,
-this is the gap.
 
 ## Dynamic imports for `@cloudflare/sandbox`
 
