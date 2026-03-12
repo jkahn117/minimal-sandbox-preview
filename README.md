@@ -4,17 +4,36 @@ A working demonstration of Cloudflare's Sandbox SDK using **Astro v6 beta** with
 
 Live at: **https://sandbox.cfsa.dev**
 
-## Hot reload in preview
+## Hot Module Replacement (HMR)
 
-The editor writes directly to the running sandbox filesystem (for example,
-`/workspace/app/src/App.vue`). After each successful write, the server action
-calls an internal Vite endpoint (`/__sandbox_hmr`) inside the container to
-trigger a reload event over Vite's HMR websocket.
+The editor writes directly to the running sandbox filesystem (e.g.
+`/workspace/app/src/App.vue`). Vite's native HMR takes care of the rest —
+when the file changes on disk, Vite detects it via polling (`usePolling: true`
+in the container's `vite.config.ts`), computes the update, and pushes it to
+the browser over a WebSocket.
 
-If HMR clients are unavailable, the UI falls back to a deterministic iframe
-refresh by updating the preview URL with a cache-busting query parameter. This
-keeps preview updates reliable even when websocket HMR is temporarily
-unavailable.
+The key to making this work in production is `proxyToSandbox()` in the Astro
+middleware. It proxies **both HTTP and WebSocket** requests to the sandbox
+container, so the Vite HMR WebSocket connection (`wss://<preview-url>/`) flows
+through transparently. The sandbox's `vite.config.ts` sets
+`hmr.clientPort: 443` so the Vite client connects on the standard HTTPS port
+rather than the container's internal port.
+
+No custom endpoints, no iframe reload fallbacks — just native Vite HMR
+through the existing proxy.
+
+### Phase 2: local dev HMR
+
+Local dev HMR is currently broken due to a bug in `@cloudflare/vite-plugin`
+where WebSocket upgrades with the `vite-hmr` protocol are dropped, and
+`dispatchFetch` uses the wrong origin. A fix has been merged
+([cloudflare/workers-sdk#12794](https://github.com/cloudflare/workers-sdk/pull/12794))
+but not yet released. Once a stable release ships:
+
+1. Bump `@cloudflare/vite-plugin` to the version containing the fix
+2. Verify local dev HMR works end-to-end
+3. Optionally set `VITE_HMR_CLIENT_PORT` dynamically for local dev (the
+   sandbox `vite.config.ts` already reads `process.env.VITE_HMR_CLIENT_PORT`)
 
 ## Reusable libraries
 
@@ -282,7 +301,10 @@ Browser                          Cloudflare Worker (Astro v6)
   ├─ <iframe src={previewUrl}> ──────────►│ Astro Middleware
   │                                      │   └─ proxyToSandbox()
   │                                      │       └─ Sandbox Container
-  │◄─ Express.js JSON response ──────────┤           └─ Port 3001
+  │◄─ Vue app (Vite dev server) ─────────┤           └─ Port 3001
+  │                                      │
+  │  [Vite HMR WebSocket also proxied    │
+  │   through proxyToSandbox()]          │
 ```
 
 ### Data flow
@@ -292,7 +314,7 @@ Browser                          Cloudflare Worker (Astro v6)
 3. **WebSocket (primary)** — Client's `SandboxPreview` connects to `/api/ws?sandboxId=...` for real-time progress. The manager broadcasts initialization steps to all connected clients.
 4. **Polling (deferred fallback)** — If WebSocket is silent after 5 seconds (broadcasts from `waitUntil` don't always reach clients), `SandboxPreview` activates polling as a backup. Self-cancels if WS comes alive.
 5. **Ready** — Once the Express server is healthy and the port is exposed, a `ready` message with the preview URL is broadcast.
-6. **Preview** — The component shows an iframe. Requests to the preview URL subdomain (`3001-{sandboxId}-express.sandbox.cfsa.dev`) hit Astro middleware, which calls `proxyToSandbox()` to route them to the correct container.
+6. **Preview** — The component shows an iframe. Requests to the preview URL subdomain (`3001-{sandboxId}-vuehmr.sandbox.cfsa.dev`) hit Astro middleware, which calls `proxyToSandbox()` to route them to the correct container. This includes both HTTP requests (page, assets) and WebSocket upgrades (Vite HMR).
 
 ### Container lifecycle
 
@@ -322,11 +344,14 @@ The `setTimeout` lives in the Worker isolate. If the isolate is evicted (~30s of
 ├── worker-configuration.d.ts       # Auto-generated types (wrangler types)
 ├── tsconfig.json
 ├── sandbox/
-│   ├── Dockerfile                  # cloudflare/sandbox:0.7.4 base + Node 22 + pnpm
-│   └── express-app/
-│       ├── package.json            # Express dependency
-│       ├── pnpm-lock.yaml
-│       └── server.js               # Pre-installed Express server (port 3001)
+│   ├── Dockerfile                  # cloudflare/sandbox:0.7.4 base + Node 22
+│   └── app/
+│       ├── package.json            # Vue, Vite, @vitejs/plugin-vue
+│       ├── vite.config.ts          # Vite config with hmr.clientPort + polling
+│       ├── index.html              # Vite HTML shell
+│       └── src/
+│           ├── main.ts             # Vue app entry
+│           └── App.vue             # Default editable component
 └── src/
     ├── worker-entry.ts             # Custom Worker entry: exports Sandbox DO + Astro handler
     ├── middleware.ts                # proxyToSandbox() — routes preview URL requests to containers
@@ -425,7 +450,8 @@ The dev server starts at `http://localhost:4321`. On first page load:
 
 1. The Astro action triggers sandbox initialization
 2. WebSocket streams progress (creating workspace, writing files, starting server...)
-3. Once ready, an iframe shows the Express.js JSON response from the sandbox container
+3. Once ready, a split pane shows the code editor (left) and live Vue app preview (right)
+4. Edit the Vue component, save with Cmd+S, and Vite HMR updates the preview without a full reload
 
 ## Deployment
 
@@ -454,11 +480,16 @@ The first serves the main page. The second catches preview URL subdomains so `pr
 ### Deploy command
 
 ```bash
-pnpm deploy
-# Runs: wrangler types && astro build && wrangler deploy
+pnpm build
+node scripts/patch-deploy-config.mjs
+wrangler deploy --config dist/server/wrangler.json
 ```
 
-`astro build` now carries `routes` and `workers_dev` into `dist/server/wrangler.json`, so the deploy flow no longer needs post-build patching.
+The Astro Cloudflare adapter doesn't carry `routes`, `workers_dev`, or
+`assets.run_worker_first` into the generated `dist/server/wrangler.json`.
+The patch script adds these fields after the build. `run_worker_first: ["/*"]`
+ensures the Worker runs before static asset serving so `proxyToSandbox()` can
+intercept all requests, including WebSocket upgrades for HMR.
 
 ## Scripts
 
