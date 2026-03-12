@@ -118,21 +118,8 @@ const editableFile = "/workspace/app/src/App.vue";
     errorMessage: "",
 
     _preview: null as SandboxPreview | null,
-    _onPreviewReload: null as ((event: Event) => void) | null,
-
-    reloadPreview() {
-      if (!this.previewUrl) return;
-      const url = new URL(this.previewUrl);
-      url.searchParams.set("_ts", Date.now().toString());
-      this.previewUrl = url.toString();
-    },
 
     init() {
-      this._onPreviewReload = () => {
-        this.reloadPreview();
-      };
-      window.addEventListener("sandbox:preview-reload", this._onPreviewReload);
-
       const preview = new SandboxPreview({
         start: callAction,
         poll: callAction,
@@ -173,9 +160,6 @@ const editableFile = "/workspace/app/src/App.vue";
 
     destroy() {
       this._preview?.destroy();
-      if (this._onPreviewReload) {
-        window.removeEventListener("sandbox:preview-reload", this._onPreviewReload);
-      }
     },
   }));
 

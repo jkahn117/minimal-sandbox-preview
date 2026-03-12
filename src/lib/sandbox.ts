@@ -20,7 +20,6 @@ const APP_DIR = "/workspace/app";
 
 /** The file shown in the editor pane. */
 export const EDITABLE_FILE = `${APP_DIR}/src/App.vue`;
-const VITE_CONFIG_FILE = `${APP_DIR}/vite.config.ts`;
 
 /** Default content for App.vue (matches sandbox/app/src/App.vue). */
 const DEFAULT_APP_VUE = `<script setup lang="ts">
@@ -40,50 +39,6 @@ const count = ref(0);
 </template>
 `;
 
-const DEFAULT_VITE_CONFIG = [
-  "// @ts-nocheck",
-  'import { defineConfig } from "vite";',
-  'import vue from "@vitejs/plugin-vue";',
-  "",
-  "export default defineConfig({",
-  "  plugins: [",
-  "    vue(),",
-  "    {",
-  '      name: "the-watcher",',
-  "      configureServer(server) {",
-  '        server.middlewares.use("/__sandbox_hmr", (req, res, next) => {',
-  "          if (!req.url) {",
-  "            next();",
-  "            return;",
-  "          }",
-  "",
-  '          const url = new URL(req.url, "http://localhost");',
-  '          const filePath = url.searchParams.get("file");',
-  "          const clientCount =",
-  "            ((server.ws as unknown as { clients?: Set<unknown> }).clients?.size ??",
-  "              0);",
-  '          server.ws.send({ type: "full-reload" });',
-  "",
-  "          res.statusCode = 200;",
-  '          res.setHeader("content-type", "application/json");',
-  "          res.end(JSON.stringify({ ok: true, filePath, clients: clientCount }));",
-  "        });",
-  "      },",
-  "    },",
-  "  ],",
-  '  cacheDir: ".sandbox-vite",',
-  "  server: {",
-  '    host: "0.0.0.0",',
-  "    allowedHosts: true,",
-  "    watch: {",
-  "      usePolling: true,",
-  "      interval: 500,",
-  "    },",
-  "  },",
-  "});",
-  "",
-].join("\n");
-
 export const sandboxManager = new SandboxManager({
   port: 3001,
   token: "vuehmr",
@@ -95,7 +50,6 @@ export const sandboxManager = new SandboxManager({
     // so the content always matches what the editor will show).
     progress("writing_files");
     await sandbox.writeFile(EDITABLE_FILE, DEFAULT_APP_VUE);
-    await sandbox.writeFile(VITE_CONFIG_FILE, DEFAULT_VITE_CONFIG);
 
     // Start the Vite dev server
     progress("starting_server");

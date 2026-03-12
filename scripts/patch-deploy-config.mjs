@@ -26,6 +26,13 @@ generated.routes = [
   },
 ];
 
+// Ensure Worker runs before static asset serving so proxyToSandbox()
+// can intercept all requests (including WebSocket upgrades for HMR).
+generated.assets = {
+  ...generated.assets,
+  run_worker_first: ["/*"],
+};
+
 // Disable workers.dev subdomain — only serve on custom domain
 generated.workers_dev = false;
 
