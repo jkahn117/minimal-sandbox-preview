@@ -7,17 +7,19 @@ export default defineConfig({
   server: {
     // Bind to all interfaces so the sandbox proxy can reach us.
     host: process.env.VITE_HOST ?? "0.0.0.0",
+    // @ts-ignore
+    port: process.env.VITE_PORT ?? 5173,
     hmr: {
       // The browser connects to the HMR WebSocket via the host's
       // external port. proxyToSandbox() in the Worker routes the WS
       // upgrade through to the container's Vite HMR server.
-      clientPort: parseInt(process.env.VITE_HMR_CLIENT_PORT || "443"),
+      clientPort: parseInt(process.env.VITE_HMR_CLIENT_PORT || "3000"),
     },
-    watch: {
-      // Container filesystems need polling for reliable change detection.
-      usePolling: true,
-      interval: 500,
-    },
+    // watch: {
+    //   // Container filesystems need polling for reliable change detection.
+    //   usePolling: true,
+    //   interval: 500,
+    // },
     // Allow the Cloudflare proxy host through
     headers: {
       "Access-Control-Allow-Origin": "*",

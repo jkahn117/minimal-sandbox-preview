@@ -20,6 +20,8 @@
   // See: cloudflare/sandbox-sdk examples/vite-sandbox
   "assets": {
     "not_found_handling": "none",
+    "html_handling": "none",
+    // "run_worker_first": ["/_/*"]
   },
   // Container config at top level so local dev can access it
   "containers": [
@@ -28,7 +30,7 @@
       "class_name": "Sandbox",
       "image": "./sandbox/Dockerfile",
       "instance_type": "standard-2",
-      "max_instances": 5,
+      "max_instances": 10,
     },
   ],
   // Durable Objects binding

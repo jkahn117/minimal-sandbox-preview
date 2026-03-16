@@ -63,7 +63,6 @@ const editableFile = "/workspace/app/slides.md";
         <iframe
           title="Sandbox Preview"
           loading="lazy"
-          :src="previewUrl"
           x-ref="previewIframe"
           allow="screen-wake-lock"
         ></iframe>
@@ -125,11 +124,8 @@ const editableFile = "/workspace/app/slides.md";
     errorMessage: "",
 
     _preview: null as SandboxPreview | null,
-    _watchSource: null as EventSource | null,
-    _refreshTimer: null as ReturnType<typeof setTimeout> | null,
 
     init() {
-      console.log("[sandbox] Alpine init, sandboxId=%s host=%s isLocalDev=%s", sandboxId, host, isLocalDev);
       const preview = new SandboxPreview({
         start: callAction,
         poll: callAction,
@@ -137,25 +133,25 @@ const editableFile = "/workspace/app/slides.md";
         // worker-entry.ts, so the WS path never succeeds. Start polling
         // immediately with a short interval. In production, give the
         // WS path a brief 3s head start before falling back to polling.
-        pollFallbackDelayMs: isLocalDev ? 0 : 3_000,
+        pollDelayMs: isLocalDev ? 0 : 3_000,
         pollIntervalMs: isLocalDev ? 2_000 : 3_000,
       });
 
       preview.on("progress", ({ step }) => {
-        console.log("[sandbox] progress: %s", step);
         const baseStep = step.includes(":") ? step.split(":")[0].trim() : step;
         this.statusText = STEP_DESCRIPTIONS[baseStep] ?? step;
         this.stepKey = baseStep;
       });
 
       preview.on("ready", ({ previewUrl }) => {
-        console.log("[sandbox] state -> ready, previewUrl:", previewUrl);
         this.state = "ready";
         this.previewUrl = previewUrl;
 
-        // Tell the EditorPane to load the file.
-        // $nextTick ensures the editor DOM is visible before we call load().
+        // Set iframe src once — avoid reactive :src binding which
+        // can trigger duplicate loads on Alpine re-renders.
         this.$nextTick(() => {
+          const iframe = (this.$refs as Record<string, HTMLIFrameElement>).previewIframe;
+          if (iframe) iframe.src = previewUrl;
           const editorEl = (this.$refs as Record<string, HTMLElement>).editorPane;
           const editorData: { load?: (id: string, filePath: string) => void } =
             Alpine.$data(
@@ -165,17 +161,9 @@ const editableFile = "/workspace/app/slides.md";
             editorData.load(sandboxId, editableFile);
           }
         });
-
-        // For editor saves, Vite HMR handles live updates automatically
-        // via the WebSocket routed through proxyToSandbox().
-        //
-        // The SSE file watcher is a fallback for changes made outside
-        // the editor (e.g. from a terminal session).
-        this.startFileWatch();
       });
 
       preview.on("error", ({ message }) => {
-        console.error("[sandbox] state -> error:", message);
         this.state = "error";
         this.errorMessage = message;
       });
@@ -184,88 +172,8 @@ const editableFile = "/workspace/app/slides.md";
       preview.init();
     },
 
-    /** Connect to the SSE file-watch endpoint for the editable file. */
-    startFileWatch() {
-      // watch() requires a directory, so we split the editable file path
-      // into dir + filename and filter server-side for just that file.
-      const dir = editableFile.substring(0, editableFile.lastIndexOf("/"));
-      const file = editableFile.substring(editableFile.lastIndexOf("/") + 1);
-      const watchUrl = `/api/watch?sandboxId=${encodeURIComponent(sandboxId)}&dir=${encodeURIComponent(dir)}&file=${encodeURIComponent(file)}`;
-      console.log("[sandbox:sse] connecting to", watchUrl);
-      const source = new EventSource(watchUrl);
-
-      source.onopen = () => {
-        console.log("[sandbox:sse] connected");
-      };
-
-      source.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          console.log("[sandbox:sse] message:", data.type, data.eventType ?? "");
-          // Only refresh on actual file modifications
-          if (data.type === "event" && data.eventType === "modify") {
-            console.log("[sandbox:sse] file modified, triggering refreshPreview");
-            this.refreshPreview();
-          }
-        } catch {
-          // Ignore parse errors
-        }
-      };
-
-      source.onerror = () => {
-        console.warn("[sandbox:sse] connection error, will retry...");
-      };
-
-      this._watchSource = source;
-    },
-
-    /**
-     * Fallback refresh for changes made outside the editor (e.g. terminal).
-     * Vite HMR handles editor saves automatically.
-     *
-     * Because the preview iframe is cross-origin (different subdomain),
-     * we can't call contentWindow.location.reload(). Instead, we create
-     * a hidden second iframe that loads the new content behind the scenes.
-     * Once it fires "load", we swap it in and remove the old one.
-     *
-     * Debounced to 200ms to coalesce rapid inotify events from SSE.
-     */
-    refreshPreview() {
-      console.log("[sandbox:refresh] debounced refresh requested");
-      if (this._refreshTimer) clearTimeout(this._refreshTimer);
-      this._refreshTimer = setTimeout(() => {
-        if (!this.previewUrl) return;
-        console.log("[sandbox:refresh] creating new iframe for:", this.previewUrl);
-        const pane = (this.$refs as Record<string, HTMLElement>).previewPane;
-        const oldIframe = (this.$refs as Record<string, HTMLIFrameElement>).previewIframe;
-        if (!pane || !oldIframe) return;
-
-        // Create a hidden iframe that loads the updated content
-        const newIframe = document.createElement("iframe");
-        newIframe.title = "Sandbox Preview";
-        newIframe.allow = "screen-wake-lock";
-        newIframe.src = this.previewUrl;
-        newIframe.style.cssText =
-          "position:absolute;top:0;left:0;width:100%;height:100%;border:none;opacity:0;";
-
-        newIframe.addEventListener("load", () => {
-          console.log("[sandbox:refresh] new iframe loaded, swapping in");
-          newIframe.style.opacity = "1";
-          newIframe.style.position = "";
-          newIframe.setAttribute("x-ref", "previewIframe");
-          oldIframe.remove();
-        }, { once: true });
-
-        // Position the pane as relative so the hidden iframe overlays correctly
-        pane.style.position = "relative";
-        pane.appendChild(newIframe);
-      }, 200);
-    },
-
     destroy() {
       this._preview?.destroy();
-      this._watchSource?.close();
-      if (this._refreshTimer) clearTimeout(this._refreshTimer);
     },
   }));
 

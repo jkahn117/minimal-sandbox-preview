@@ -59,7 +59,6 @@
      * Passes in the sandboxId and filePath, then loads the file content.
      */
     async load(sandboxId: string, filePath: string) {
-      console.log("[editor] load(%s, %s)", sandboxId, filePath);
       this.sandboxId = sandboxId;
       this.filePath = filePath;
       this.loading = true;
@@ -68,15 +67,12 @@
       try {
         const result = await actions.readFile({ sandboxId, filePath });
         if (result.error) {
-          console.error("[editor] readFile error:", result.error.message);
           this.error = result.error.message;
           return;
         }
-        console.log("[editor] file loaded, %d bytes", result.data.content.length);
         this.content = result.data.content;
         this.dirty = false;
       } catch (err) {
-        console.error("[editor] readFile exception:", err);
         this.error = err instanceof Error ? err.message : "Failed to load file";
       } finally {
         this.loading = false;
@@ -85,8 +81,6 @@
 
     async saveFile() {
       if (this.saving || !this.dirty) return;
-      console.log("[editor] saveFile start (%d bytes)", this.content.length);
-      const t0 = performance.now();
       this.saving = true;
       try {
         const result = await actions.writeFile({
@@ -94,22 +88,13 @@
           filePath: this.filePath,
           content: this.content,
         });
-        const elapsed = (performance.now() - t0).toFixed(0);
         if (result.error) {
-          console.error("[editor] writeFile error after %sms:", elapsed, result.error.message);
+          console.error("Editor save failed:", result.error.message);
           return;
         }
-
-        console.log("[editor] writeFile success in %sms — HMR should pick up change", elapsed);
         this.dirty = false;
-
-        // No explicit preview refresh needed here. Vite's HMR detects
-        // the file change via chokidar and pushes an update to the
-        // Slidev app inside the iframe over the HMR WebSocket.
-        // The SSE file-watch in SandboxComponent acts as a fallback
-        // for changes made outside the editor (e.g. from a terminal).
       } catch (err) {
-        console.error("[editor] writeFile exception:", err);
+        console.error("Editor save failed:", err);
       } finally {
         this.saving = false;
       }

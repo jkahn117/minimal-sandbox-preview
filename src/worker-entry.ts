@@ -13,19 +13,9 @@ export default {
     // sandbox container. This must be called first — before any
     // application logic — so that requests on exposed-port subdomains
     // (e.g. 3001-sandbox-{id}-slidev.sandbox.cfsa.dev) are forwarded
-    // to the container. This also enables Vite HMR WebSocket
-    // connections through the preview URL.
-    const url = new URL(request.url);
-    const isUpgrade = request.headers.get("Upgrade")?.toLowerCase() === "websocket";
-    console.log(`[worker] ${request.method} ${url.hostname}${url.pathname} upgrade=${isUpgrade}`);
-
+    // to the container.
     const proxyResponse = await proxyToSandbox(request, env);
-    if (proxyResponse) {
-      console.log(`[worker] proxyToSandbox handled -> ${proxyResponse.status} (ws=${proxyResponse.webSocket != null})`);
-      return proxyResponse;
-    }
-
-    console.log(`[worker] proxyToSandbox returned null, forwarding to Astro`);
+    if (proxyResponse) return proxyResponse;
     // Everything below is your own application (Astro routes, API
     // endpoints, etc.) served from the main domain.
     return handler.fetch(request, env, ctx);

@@ -14,6 +14,8 @@
     "@cloudflare/sandbox": "0.7.17",
     "alpinejs": "^3.15.8",
     "astro": "6.0.4",
+    "hono": "^4.12.8",
+    "hono-agents": "^3.0.7",
     "zod": "^4.3.6"
   },
   "overrides": {
@@ -21,8 +23,8 @@
   },
   "devDependencies": {
     "@types/alpinejs": "^3.13.11",
-    "@types/node": "^25.2.3",
-    "typescript": "^5.3.0",
-    "wrangler": "^4.73.0"
+    "@types/node": "^25.5.0",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.74.0"
   }
 }

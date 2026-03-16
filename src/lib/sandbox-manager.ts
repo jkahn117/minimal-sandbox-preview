@@ -107,9 +107,9 @@ interface ManagedSandboxState {
 // ---------------------------------------------------------------------------
 
 export type StartResult =
-  | { status: "ready"; previewUrl: string; wsEndpoint: string }
-  | { status: "initializing"; wsEndpoint: string; message: string }
-  | { status: "error"; wsEndpoint: string; message: string };
+  | { status: "ready"; previewUrl: string }
+  | { status: "initializing"; message: string }
+  | { status: "error"; message: string };
 
 // ---------------------------------------------------------------------------
 // Implementation
@@ -150,44 +150,31 @@ export class SandboxManager {
     waitUntil?: (promise: Promise<unknown>) => void,
   ): StartResult {
     const state = this.getOrCreate(sandboxId);
-    const wsEndpoint = `/api/ws?sandboxId=${encodeURIComponent(sandboxId)}`;
-
-    console.log(
-      `[manager:${sandboxId}] start() called — initialized=${state.isInitialized} initializing=${state.isInitializing} error=${state.initError} step=${state.currentStep}`,
-    );
 
     if (
       state.isInitialized &&
       state.previewUrl &&
       !this.hasExpectedToken(state.previewUrl)
     ) {
-      console.warn(
-        `[manager:${sandboxId}] Cached preview URL token mismatch, forcing re-init: ${state.previewUrl}`,
-      );
       state.isInitialized = false;
       state.previewUrl = null;
     }
 
     if (state.isInitialized && state.previewUrl) {
-      console.log(`[manager:${sandboxId}] -> ready (cached): ${state.previewUrl}`);
-      return { status: "ready", previewUrl: state.previewUrl, wsEndpoint };
+      return { status: "ready", previewUrl: state.previewUrl };
     }
 
     if (state.isInitializing) {
-      console.log(`[manager:${sandboxId}] -> initializing (already in progress, step=${state.currentStep})`);
       return {
         status: "initializing",
-        wsEndpoint,
         message: "Initialization already in progress",
       };
     }
 
     if (state.initError) {
-      console.log(`[manager:${sandboxId}] -> error (previous): ${state.initError}`);
-      return { status: "error", wsEndpoint, message: state.initError };
+      return { status: "error", message: state.initError };
     }
 
-    console.log(`[manager:${sandboxId}] -> initializing (kicking off runInit)`);
     state.isInitializing = true;
 
     const initPromise = this.runInit(sandboxId, host, sandboxBinding);
@@ -197,7 +184,6 @@ export class SandboxManager {
 
     return {
       status: "initializing",
-      wsEndpoint,
       message: "Initialization started",
     };
   }
@@ -233,19 +219,15 @@ export class SandboxManager {
   ): Promise<void> {
     const state = this.getOrCreate(sandboxId);
 
-    const t0 = Date.now();
     try {
-      console.log(`[manager:${sandboxId}] runInit starting...`);
-
       const { getSandbox } = await import("@cloudflare/sandbox");
       const sandbox = getSandbox(sandboxBinding, sandboxId, {
         normalizeId: true,
         sleepAfter: this.opts.sleepAfter,
       });
 
-      // --- Recovery check: if the port is already exposed (isolate
+      // Recovery check: if the port is already exposed (isolate
       // eviction case), skip init and go straight to "ready".
-      console.log(`[manager:${sandboxId}] checking existing port...`);
       const existingUrl = await this.checkExistingPort(
         sandbox,
         sandboxId,
@@ -253,38 +235,28 @@ export class SandboxManager {
       );
       if (existingUrl) {
         const fullUrl = `${existingUrl.replace(/\/$/, "")}${this.opts.basePath}`;
-        console.log(`[manager:${sandboxId}] recovered existing port in ${Date.now() - t0}ms`);
         this.markReady(sandboxId, state, fullUrl);
         return;
       }
 
-      // --- Run app-specific initialization ---
+      // Run app-specific initialization
       const progress = (step: string) => {
         state.currentStep = step;
-        console.log(`[manager:${sandboxId}] step=${step} (+${Date.now() - t0}ms)`);
       };
 
-      console.log(`[manager:${sandboxId}] running initialize callback...`);
       await this.opts.initialize({ sandbox, progress, host });
-      console.log(`[manager:${sandboxId}] initialize callback done (+${Date.now() - t0}ms)`);
 
-      // --- Expose port (with PortAlreadyExposed recovery) ---
+      // Expose port (with PortAlreadyExposed recovery)
       progress("exposing_port");
       const rawUrl = await this.exposePortSafe(sandbox, sandboxId, host);
-
-      // Append basePath to namespace sandbox assets under a sub-path
       const previewUrl = `${rawUrl.replace(/\/$/, "")}${this.opts.basePath}`;
 
       this.markReady(sandboxId, state, previewUrl);
-      console.log(
-        `[manager:${sandboxId}] READY in ${Date.now() - t0}ms, preview: ${previewUrl}`,
-      );
     } catch (error) {
       state.initError =
         error instanceof Error ? error.message : "Unknown error";
       state.isInitializing = false;
       state.currentStep = "";
-      console.error(`[manager:${sandboxId}] FAILED after ${Date.now() - t0}ms:`, error);
     }
   }
 
@@ -315,24 +287,10 @@ export class SandboxManager {
         (p) => p.port === this.opts.port && this.hasExpectedToken(p.url),
       );
       if (existing) {
-        console.log(
-          `[sandbox:${sandboxId}] Port ${this.opts.port} already exposed, reusing: ${existing.url}`,
-        );
         return existing.url;
       }
-
-      const mismatched = ports.find((p) => p.port === this.opts.port);
-      if (mismatched) {
-        console.warn(
-          `[sandbox:${sandboxId}] Port ${this.opts.port} exposed with mismatched token, ignoring stale URL: ${mismatched.url}`,
-        );
-      }
-    } catch (err) {
+    } catch {
       // Container may not be running yet — proceed with init
-      console.log(
-        `[sandbox:${sandboxId}] Could not check exposed ports (container may be new):`,
-        err instanceof Error ? err.message : err,
-      );
     }
     return null;
   }
@@ -362,9 +320,6 @@ export class SandboxManager {
           (p) => p.port === this.opts.port && this.hasExpectedToken(p.url),
         );
         if (existing) {
-          console.log(
-            `[sandbox:${sandboxId}] Port already exposed (race), reusing: ${existing.url}`,
-          );
           return existing.url;
         }
 

@@ -108,14 +108,12 @@ export const sandboxManager = new SandboxManager({
     // mechanism and resolves as soon as port 3001 responds with HTTP 2xx/3xx.
     // This replaces our manual curl loop and is significantly faster.
     progress("waiting_for_ready");
-    const waitStart = Date.now();
     try {
       await proc.waitForPort(3001, {
         mode: "http",
         path: VITE_BASE,
         status: { min: 200, max: 399 },
       });
-      console.log(`[sandbox-init] waitForPort resolved in ${Date.now() - waitStart}ms`);
     } catch (err) {
       // If waitForPort fails, grab logs for diagnostics
       const logs = await proc.getLogs();
