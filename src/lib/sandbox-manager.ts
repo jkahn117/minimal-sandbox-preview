@@ -8,17 +8,20 @@
  * This manager adds what the SDK does **not** provide:
  * - In-memory state machine per sandbox ID (idle → initializing → ready | error)
  * - Idempotent start (polling returns cached status)
- * - WebSocket broadcast of progress/ready/error events
- * - WebSocket upgrade handler for API routes
+ *
+ * Readiness detection uses the SDK's `wsConnect()` — the browser opens a
+ * WebSocket to `/api/ws` which proxies through the Sandbox DO and blocks
+ * until the container + port are healthy. When `ws.onopen` fires client-side,
+ * the client polls this manager once to retrieve the cached preview URL.
  *
  * ## Usage
  *
  * ```typescript
  * const manager = new SandboxManager({
  *   port: 3001,
- *   token: "vinext",
+ *   token: "slidev",
  *   sleepAfter: "5m",
- *   initialize: async (sandbox, { progress }) => {
+ *   initialize: async ({ sandbox, progress }) => {
  *     progress("writing_files");
  *     await sandbox.writeFile("/workspace/server.js", code);
  *     progress("starting_server");
@@ -29,9 +32,6 @@
  *
  * // In your Astro action:
  * return manager.start(sandboxId, host, binding, waitUntil);
- *
- * // In your WS API route:
- * return manager.handleWebSocketUpgrade(request, sandboxId);
  * ```
  */
 
@@ -42,10 +42,12 @@ import type { Sandbox, ISandbox } from "@cloudflare/sandbox";
 // ---------------------------------------------------------------------------
 
 export interface InitContext {
-  /** Report a progress step to connected WebSocket clients. */
+  /** Report a progress step (logged server-side). */
   progress: (step: string) => void;
   /** The sandbox handle — full SDK Sandbox stub via RPC. */
   sandbox: ISandbox;
+  /** The host (e.g. "sandbox.cfsa.dev" or "localhost:4321"). */
+  host: string;
 }
 
 export interface SandboxManagerOptions {
@@ -70,11 +72,12 @@ export interface SandboxManagerOptions {
   sleepAfter?: string;
 
   /**
-   * The WebSocket endpoint path pattern. `{sandboxId}` is replaced
-   * with the actual ID.
-   * @default "/api/ws?sandboxId={sandboxId}"
+   * Base path prefix for the preview URL. Appended to the exposed port
+   * URL to namespace sandbox assets under a sub-path, avoiding route
+   * collisions with the host app.
+   * @default "/"
    */
-  wsEndpointPattern?: string;
+  basePath?: string;
 
   /**
    * App-specific initialization logic. Called with a sandbox handle and
@@ -97,7 +100,6 @@ interface ManagedSandboxState {
   previewUrl: string | null;
   currentStep: string;
   initError: string | null;
-  connections: Set<WebSocket>;
 }
 
 // ---------------------------------------------------------------------------
@@ -115,10 +117,7 @@ export type StartResult =
 
 export class SandboxManager {
   private readonly opts: Required<
-    Pick<
-      SandboxManagerOptions,
-      "port" | "token" | "sleepAfter" | "wsEndpointPattern"
-    >
+    Pick<SandboxManagerOptions, "port" | "token" | "sleepAfter" | "basePath">
   > &
     SandboxManagerOptions;
   private readonly sandboxes = new Map<string, ManagedSandboxState>();
@@ -126,7 +125,7 @@ export class SandboxManager {
   constructor(opts: SandboxManagerOptions) {
     this.opts = {
       sleepAfter: "5m",
-      wsEndpointPattern: "/api/ws?sandboxId={sandboxId}",
+      basePath: "/",
       ...opts,
     };
   }
@@ -151,7 +150,11 @@ export class SandboxManager {
     waitUntil?: (promise: Promise<unknown>) => void,
   ): StartResult {
     const state = this.getOrCreate(sandboxId);
-    const wsEndpoint = this.wsEndpoint(sandboxId);
+    const wsEndpoint = `/api/ws?sandboxId=${encodeURIComponent(sandboxId)}`;
+
+    console.log(
+      `[manager:${sandboxId}] start() called — initialized=${state.isInitialized} initializing=${state.isInitializing} error=${state.initError} step=${state.currentStep}`,
+    );
 
     if (
       state.isInitialized &&
@@ -159,17 +162,19 @@ export class SandboxManager {
       !this.hasExpectedToken(state.previewUrl)
     ) {
       console.warn(
-        `[sandbox:${sandboxId}] Cached preview URL token mismatch, forcing re-init: ${state.previewUrl}`,
+        `[manager:${sandboxId}] Cached preview URL token mismatch, forcing re-init: ${state.previewUrl}`,
       );
       state.isInitialized = false;
       state.previewUrl = null;
     }
 
     if (state.isInitialized && state.previewUrl) {
+      console.log(`[manager:${sandboxId}] -> ready (cached): ${state.previewUrl}`);
       return { status: "ready", previewUrl: state.previewUrl, wsEndpoint };
     }
 
     if (state.isInitializing) {
+      console.log(`[manager:${sandboxId}] -> initializing (already in progress, step=${state.currentStep})`);
       return {
         status: "initializing",
         wsEndpoint,
@@ -178,9 +183,11 @@ export class SandboxManager {
     }
 
     if (state.initError) {
+      console.log(`[manager:${sandboxId}] -> error (previous): ${state.initError}`);
       return { status: "error", wsEndpoint, message: state.initError };
     }
 
+    console.log(`[manager:${sandboxId}] -> initializing (kicking off runInit)`);
     state.isInitializing = true;
 
     const initPromise = this.runInit(sandboxId, host, sandboxBinding);
@@ -191,51 +198,8 @@ export class SandboxManager {
     return {
       status: "initializing",
       wsEndpoint,
-      message: "Connect to WebSocket for progress updates",
+      message: "Initialization started",
     };
-  }
-
-  /**
-   * Handle a WebSocket upgrade request. Call from your API route.
-   * Returns a 101 Response with the WebSocket attached, or a 400 if
-   * the request isn't a valid upgrade.
-   */
-  handleWebSocketUpgrade(request: Request, sandboxId: string): Response {
-    const upgradeHeader = request.headers.get("Upgrade");
-    if (upgradeHeader !== "websocket") {
-      return new Response("Expected websocket", { status: 400 });
-    }
-
-    const [client, server] = Object.values(new WebSocketPair());
-    const state = this.getOrCreate(sandboxId);
-
-    server.accept();
-    state.connections.add(server);
-
-    // Send current state to newly connected client. If no progress
-    // yet, stay silent — avoid a meaningless "connected" ack that
-    // would suppress the client's polling fallback.
-    if (state.isInitialized && state.previewUrl) {
-      server.send(
-        JSON.stringify({ type: "ready", previewUrl: state.previewUrl }),
-      );
-    } else if (state.initError) {
-      server.send(JSON.stringify({ type: "error", message: state.initError }));
-    } else if (state.currentStep) {
-      server.send(
-        JSON.stringify({ type: "progress", step: state.currentStep }),
-      );
-    }
-
-    server.addEventListener("close", () => {
-      state.connections.delete(server);
-    });
-
-    return new Response(null, {
-      status: 101,
-      // @ts-ignore — webSocket property exists in Cloudflare Workers runtime
-      webSocket: client,
-    });
   }
 
   // -----------------------------------------------------------------------
@@ -251,33 +215,10 @@ export class SandboxManager {
         previewUrl: null,
         currentStep: "",
         initError: null,
-        connections: new Set(),
       };
       this.sandboxes.set(sandboxId, state);
     }
     return state;
-  }
-
-  private wsEndpoint(sandboxId: string): string {
-    return this.opts.wsEndpointPattern.replace("{sandboxId}", sandboxId);
-  }
-
-  // -----------------------------------------------------------------------
-  // Internal — broadcast
-  // -----------------------------------------------------------------------
-
-  private broadcast(
-    state: ManagedSandboxState,
-    message: Record<string, unknown>,
-  ): void {
-    const data = JSON.stringify(message);
-    for (const ws of state.connections) {
-      try {
-        ws.send(data);
-      } catch {
-        state.connections.delete(ws);
-      }
-    }
   }
 
   // -----------------------------------------------------------------------
@@ -292,8 +233,9 @@ export class SandboxManager {
   ): Promise<void> {
     const state = this.getOrCreate(sandboxId);
 
+    const t0 = Date.now();
     try {
-      console.log(`[sandbox:${sandboxId}] Starting initialization...`);
+      console.log(`[manager:${sandboxId}] runInit starting...`);
 
       const { getSandbox } = await import("@cloudflare/sandbox");
       const sandbox = getSandbox(sandboxBinding, sandboxId, {
@@ -303,39 +245,46 @@ export class SandboxManager {
 
       // --- Recovery check: if the port is already exposed (isolate
       // eviction case), skip init and go straight to "ready".
+      console.log(`[manager:${sandboxId}] checking existing port...`);
       const existingUrl = await this.checkExistingPort(
         sandbox,
         sandboxId,
         host,
       );
       if (existingUrl) {
-        this.markReady(sandboxId, state, existingUrl);
+        const fullUrl = `${existingUrl.replace(/\/$/, "")}${this.opts.basePath}`;
+        console.log(`[manager:${sandboxId}] recovered existing port in ${Date.now() - t0}ms`);
+        this.markReady(sandboxId, state, fullUrl);
         return;
       }
 
       // --- Run app-specific initialization ---
       const progress = (step: string) => {
         state.currentStep = step;
-        this.broadcast(state, { type: "progress", step });
+        console.log(`[manager:${sandboxId}] step=${step} (+${Date.now() - t0}ms)`);
       };
 
-      await this.opts.initialize({ sandbox, progress });
+      console.log(`[manager:${sandboxId}] running initialize callback...`);
+      await this.opts.initialize({ sandbox, progress, host });
+      console.log(`[manager:${sandboxId}] initialize callback done (+${Date.now() - t0}ms)`);
 
       // --- Expose port (with PortAlreadyExposed recovery) ---
       progress("exposing_port");
-      const previewUrl = await this.exposePortSafe(sandbox, sandboxId, host);
+      const rawUrl = await this.exposePortSafe(sandbox, sandboxId, host);
+
+      // Append basePath to namespace sandbox assets under a sub-path
+      const previewUrl = `${rawUrl.replace(/\/$/, "")}${this.opts.basePath}`;
 
       this.markReady(sandboxId, state, previewUrl);
       console.log(
-        `[sandbox:${sandboxId}] Initialized successfully, preview: ${previewUrl}`,
+        `[manager:${sandboxId}] READY in ${Date.now() - t0}ms, preview: ${previewUrl}`,
       );
     } catch (error) {
       state.initError =
         error instanceof Error ? error.message : "Unknown error";
       state.isInitializing = false;
       state.currentStep = "";
-      this.broadcast(state, { type: "error", message: state.initError });
-      console.error(`Sandbox ${sandboxId} initialization failed:`, error);
+      console.error(`[manager:${sandboxId}] FAILED after ${Date.now() - t0}ms:`, error);
     }
   }
 
@@ -348,7 +297,6 @@ export class SandboxManager {
     state.isInitialized = true;
     state.isInitializing = false;
     state.currentStep = "ready";
-    this.broadcast(state, { type: "ready", previewUrl });
   }
 
   /**
@@ -392,9 +340,6 @@ export class SandboxManager {
   /**
    * Expose the port, catching PortAlreadyExposed from race conditions
    * between the recovery check and the expose call.
-   *
-   * The SDK's PortAlreadyExposedError is not exported as a type, so we
-   * check the error's `code` property instead of using `instanceof`.
    */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private async exposePortSafe(
@@ -410,12 +355,8 @@ export class SandboxManager {
       });
       return exposed.url;
     } catch (err) {
-      // SDK throws PortAlreadyExposedError with code "PORT_ALREADY_EXPOSED"
-      // but the class isn't exported in types — check the code property.
       const code = (err as { code?: string }).code;
       if (code === "PORT_ALREADY_EXPOSED") {
-        // Port was exposed between our check and this call — recover
-        // by fetching the existing URL.
         const ports = await sandbox.getExposedPorts(host);
         const existing = ports.find(
           (p) => p.port === this.opts.port && this.hasExpectedToken(p.url),

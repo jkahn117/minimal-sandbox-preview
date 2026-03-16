@@ -1,17 +1,28 @@
 /**
- * Framework-agnostic client for tracking long-running sandbox initialization.
+ * Framework-agnostic client for tracking sandbox readiness.
  *
- * Manages a WebSocket connection (primary) with deferred polling fallback
- * to track server-side progress and notify the consumer when a sandbox
- * preview URL is ready.
+ * Uses two strategies in parallel to detect when the sandbox is ready:
  *
- * ## Why both WebSocket and polling?
+ * 1. **WebSocket (primary in production):** The SDK's `wsConnect()` proxies
+ *    through the Sandbox Durable Object. The upgrade blocks until the
+ *    container and target port are healthy, so `ws.onopen` = ready.
  *
- * Sandbox initialization runs server-side inside `waitUntil()`, which is
- * a different I/O context than the WebSocket connections. In workerd,
- * broadcasts from `waitUntil` don't reliably reach WS clients connected
- * in a different request. Polling covers this gap — but only activates
- * if WebSocket is silent, to avoid wasteful duplicate requests.
+ * 2. **Polling fallback:** After a configurable delay, polls the `poll()`
+ *    callback on an interval until the server reports `status: "ready"`.
+ *    This is the primary path in local development where the Vite dev
+ *    server cannot proxy WebSocket upgrades to the Worker entrypoint.
+ *
+ * Whichever strategy resolves first wins — the other is cancelled via
+ * `stopAll()`.
+ *
+ * ## Flow
+ *
+ * 1. Call `start()` to trigger server-side initialization (writeFile,
+ *    startProcess, exposePort) via `waitUntil`
+ * 2. If already ready → emit "ready" immediately
+ * 3. Otherwise → start both WebSocket + polling fallback
+ * 4. First to see "ready" wins → emit "ready", cancel the other
+ * 5. Hard deadline at `maxWaitMs` emits error if neither succeeds
  *
  * ## Usage
  *
@@ -62,37 +73,38 @@ export interface SandboxPreviewOptions {
   start: () => Promise<ActionResult>;
 
   /**
-   * Check server-side status. Called periodically as a fallback when
-   * WebSocket is silent. Should be idempotent and cheap.
+   * Check server-side status. Called after the WebSocket connects to
+   * retrieve the preview URL. Should be idempotent and cheap.
    */
   poll: () => Promise<ActionResult>;
 
   /**
-   * Grace period (ms) before polling activates. Gives the WebSocket
-   * time to deliver before falling back.
-   * @default 5000
+   * Initial delay (ms) before retrying a failed WebSocket connection.
+   * Doubles on each retry (exponential backoff).
+   * @default 2000
    */
-  pollFallbackDelay?: number;
+  wsRetryDelay?: number;
 
   /**
-   * Polling interval (ms). Intentionally slow since this is a backup.
-   * @default 5000
-   */
-  pollInterval?: number;
-
-  /**
-   * Delay (ms) before auto-reconnecting a closed WebSocket.
-   * @default 3000
-   */
-  wsReconnectDelay?: number;
-
-  /**
-   * Maximum time (ms) to wait for a terminal state (ready or error)
-   * before giving up. Covers both WS and polling. After this, an
-   * error is emitted.
+   * Maximum time (ms) to wait for the sandbox to become ready.
+   * After this, an error is emitted.
    * @default 120000
    */
   maxWaitMs?: number;
+
+  /**
+   * Delay (ms) before the polling fallback kicks in. Gives the WS path
+   * a brief head start. In local dev the WS path never works, so set
+   * this to 0 for immediate polling.
+   * @default 3000
+   */
+  pollFallbackDelayMs?: number;
+
+  /**
+   * Interval (ms) between poll attempts once the fallback is active.
+   * @default 3000
+   */
+  pollIntervalMs?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -122,26 +134,18 @@ type EventHandler<E extends EventName> = (
 export class SandboxPreview {
   private readonly opts: Required<SandboxPreviewOptions>;
 
-  private pollTimer: ReturnType<typeof setInterval> | null = null;
-  private pollFallbackTimer: ReturnType<typeof setTimeout> | null = null;
   private ws: WebSocket | null = null;
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private deadlineTimer: ReturnType<typeof setTimeout> | null = null;
+  private pollFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+  private pollIntervalTimer: ReturnType<typeof setTimeout> | null = null;
+  private currentRetryDelay: number;
 
   /** True once a terminal state (ready or error) has been reached. */
   private settled = false;
 
-  /**
-   * True once the WebSocket has delivered a substantive message.
-   * Used to delay the polling fallback — but NOT to suppress it entirely.
-   * WS may deliver progress messages but fail to deliver the terminal
-   * "ready" event due to waitUntil I/O isolation in workerd.
-   */
-  private wsHasDelivered = false;
-
-  /** Timestamp of the last WS progress message. Used to detect stalls. */
-  private lastWsProgressAt = 0;
-
-  /** Deadline timer — emits error if no terminal state within maxWaitMs. */
-  private deadlineTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The WS endpoint path, extracted from the start() response. */
+  private wsEndpoint: string | null = null;
 
   private listeners: {
     [E in EventName]?: Set<EventHandler<E>>;
@@ -149,12 +153,13 @@ export class SandboxPreview {
 
   constructor(opts: SandboxPreviewOptions) {
     this.opts = {
-      pollFallbackDelay: 5_000,
-      pollInterval: 5_000,
-      wsReconnectDelay: 3_000,
+      wsRetryDelay: 2_000,
       maxWaitMs: 120_000,
+      pollFallbackDelayMs: 3_000,
+      pollIntervalMs: 3_000,
       ...opts,
     };
+    this.currentRetryDelay = this.opts.wsRetryDelay;
   }
 
   // -----------------------------------------------------------------------
@@ -163,8 +168,13 @@ export class SandboxPreview {
 
   /** Kick off initialization. Call once after registering event listeners. */
   async init(): Promise<void> {
+    console.log("[preview] init() called");
     try {
+      this.emit("progress", { step: "starting" });
+
+      console.log("[preview] calling start()...");
       const result = await this.opts.start();
+      console.log("[preview] start() returned:", JSON.stringify(result));
 
       if (result.error) {
         this.emitError(result.error.message ?? "Failed to start sandbox");
@@ -179,26 +189,34 @@ export class SandboxPreview {
 
       // Already ready (e.g. page refresh while container still alive)
       if (data.status === "ready" && data.previewUrl) {
+        console.log("[preview] already ready, previewUrl:", data.previewUrl);
         this.emitReady(data.previewUrl);
         return;
       }
 
       // Already failed
       if (data.status === "error") {
+        console.log("[preview] start returned error:", data.message);
         this.emitError(data.message ?? "Sandbox initialization failed");
         return;
       }
 
-      // Initializing — connect WS + schedule poll fallback + deadline
-      if (data.wsEndpoint) {
-        this.connectWebSocket(data.wsEndpoint);
+      // Initializing — connect WS and wait for the container to be ready
+      this.wsEndpoint = data.wsEndpoint ?? null;
+      if (!this.wsEndpoint) {
+        this.emitError("No WebSocket endpoint returned from start()");
+        return;
       }
-      this.schedulePollFallback();
+
+      console.log("[preview] status=initializing, wsEndpoint:", this.wsEndpoint);
+      this.emit("progress", { step: "waiting_for_ready" });
       this.scheduleDeadline();
+      this.connectWebSocket();
+      this.schedulePollFallback();
     } catch (err) {
       const message =
         err instanceof Error ? err.message : "Failed to start sandbox";
-      console.error("SandboxPreview.init() failed:", err);
+      console.error("[preview] init() failed:", err);
       this.emitError(message);
     }
   }
@@ -245,11 +263,13 @@ export class SandboxPreview {
   }
 
   private emitReady(previewUrl: string): void {
+    console.log("[preview] emitReady:", previewUrl);
     this.stopAll();
     this.emit("ready", { previewUrl });
   }
 
   private emitError(message: string): void {
+    console.error("[preview] emitError:", message);
     this.stopAll();
     this.emit("error", { message });
   }
@@ -264,73 +284,192 @@ export class SandboxPreview {
       clearTimeout(this.deadlineTimer);
       this.deadlineTimer = null;
     }
+    if (this.retryTimer) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
     if (this.pollFallbackTimer) {
       clearTimeout(this.pollFallbackTimer);
       this.pollFallbackTimer = null;
     }
-    if (this.pollTimer) {
-      clearInterval(this.pollTimer);
-      this.pollTimer = null;
+    if (this.pollIntervalTimer) {
+      clearTimeout(this.pollIntervalTimer);
+      this.pollIntervalTimer = null;
     }
     if (this.ws) {
-      this.ws.onclose = null; // prevent auto-reconnect
+      this.ws.onopen = null;
+      this.ws.onclose = null;
+      this.ws.onerror = null;
+      this.ws.onmessage = null;
       this.ws.close();
       this.ws = null;
     }
   }
 
   // -----------------------------------------------------------------------
-  // Internal — WebSocket
+  // Internal — WebSocket (readiness detection via wsConnect proxy)
   // -----------------------------------------------------------------------
 
-  private connectWebSocket(endpoint: string): void {
+  /**
+   * Open a WebSocket to the wsConnect proxy endpoint. The SDK's wsConnect
+   * blocks until the container is up and the target port is healthy before
+   * completing the upgrade. So `onopen` = sandbox ready.
+   *
+   * On failure (container still provisioning, network error), we retry
+   * with exponential backoff.
+   */
+  private connectWebSocket(): void {
+    if (this.settled || !this.wsEndpoint) return;
+
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    this.ws = new WebSocket(`${protocol}//${window.location.host}${endpoint}`);
+    const url = `${protocol}//${window.location.host}${this.wsEndpoint}`;
 
-    this.ws.onmessage = (event: MessageEvent) => {
-      const data = JSON.parse(event.data);
-      // Only count substantive messages as "delivered". A handshake ack
-      // (e.g. { type: "connected" }) doesn't carry init state and must
-      // not suppress the polling fallback.
-      if (
-        data.type === "progress" ||
-        data.type === "ready" ||
-        data.type === "error"
-      ) {
-        this.wsHasDelivered = true;
-        this.lastWsProgressAt = Date.now();
+    console.log("[preview:ws] connecting to", url);
+    this.ws = new WebSocket(url);
+
+    this.ws.onopen = () => {
+      if (this.settled) {
+        console.log("[preview:ws] onopen fired but already settled, ignoring");
+        return;
       }
-      this.handleMessage(data);
+      console.log("[preview:ws] connected — sandbox is ready, fetching preview URL");
+      this.fetchPreviewUrl();
     };
 
-    this.ws.onerror = () => {
-      console.warn(
-        "SandboxPreview: WebSocket error, relying on polling fallback",
-      );
-    };
-
-    this.ws.onclose = () => {
+    this.ws.onerror = (event) => {
       if (this.settled) return;
-      // Auto-reconnect — WS may close during container startup.
-      setTimeout(
-        () => this.connectWebSocket(endpoint),
-        this.opts.wsReconnectDelay,
+      console.warn("[preview:ws] error", event);
+    };
+
+    this.ws.onclose = (event) => {
+      if (this.settled) {
+        console.log("[preview:ws] closed after settle (expected)");
+        return;
+      }
+      console.log(
+        `[preview:ws] closed (code=${event.code}, reason="${event.reason}", clean=${event.wasClean}), retrying in ${this.currentRetryDelay}ms`,
       );
+      this.scheduleRetry();
     };
   }
 
-  private handleMessage(data: Record<string, string>): void {
-    switch (data.type) {
-      case "progress":
-        this.emit("progress", { step: data.step });
-        break;
-      case "ready":
+  /**
+   * After the WS connects (sandbox ready), poll the start action once
+   * to retrieve the cached preview URL.
+   */
+  private async fetchPreviewUrl(): Promise<void> {
+    console.log("[preview:ws] fetchPreviewUrl called");
+    try {
+      const result = await this.opts.poll();
+      console.log("[preview:ws] poll returned:", JSON.stringify(result));
+      if (result.error) {
+        this.emitError(result.error.message ?? "Failed to get preview URL");
+        return;
+      }
+
+      const data = result.data;
+      if (data?.status === "ready" && data.previewUrl) {
+        console.log("[preview:ws] poll says ready:", data.previewUrl);
         this.emitReady(data.previewUrl);
-        break;
-      case "error":
-        this.emitError(data.message);
-        break;
+      } else if (data?.status === "error") {
+        this.emitError(data.message ?? "Sandbox initialization failed");
+      } else {
+        // Init may still be running (exposePort not done yet). Retry poll.
+        console.log(
+          "[preview:ws] WS connected but init not complete (status=%s), re-polling in 2s",
+          data?.status,
+        );
+        this.emit("progress", { step: "exposing_port" });
+        setTimeout(() => {
+          if (!this.settled) this.fetchPreviewUrl();
+        }, 2_000);
+      }
+    } catch (err) {
+      console.error("[preview:ws] fetchPreviewUrl failed:", err);
+      this.emitError(
+        err instanceof Error ? err.message : "Failed to get preview URL",
+      );
     }
+  }
+
+  // -----------------------------------------------------------------------
+  // Internal — retry with exponential backoff
+  // -----------------------------------------------------------------------
+
+  private scheduleRetry(): void {
+    if (this.settled) return;
+    this.retryTimer = setTimeout(() => {
+      if (this.settled) return;
+      this.connectWebSocket();
+    }, this.currentRetryDelay);
+
+    // Exponential backoff, capped at 15s
+    this.currentRetryDelay = Math.min(this.currentRetryDelay * 1.5, 15_000);
+  }
+
+  // -----------------------------------------------------------------------
+  // Internal — polling fallback
+  // -----------------------------------------------------------------------
+
+  /**
+   * Schedule a polling fallback that kicks in after `pollFallbackDelayMs`.
+   * In local dev (delay = 0) this starts immediately; in production the
+   * WebSocket path usually wins before polling begins.
+   */
+  private schedulePollFallback(): void {
+    const delay = this.opts.pollFallbackDelayMs;
+    console.log(
+      `[preview:poll] fallback scheduled in ${delay}ms (interval: ${this.opts.pollIntervalMs}ms)`,
+    );
+    this.pollFallbackTimer = setTimeout(() => {
+      if (this.settled) {
+        console.log("[preview:poll] fallback fired but already settled, skipping");
+        return;
+      }
+      console.log("[preview:poll] fallback active, starting to poll");
+      this.pollForReady();
+    }, delay);
+  }
+
+  /**
+   * Poll the server for readiness. If the status is "ready", emit and
+   * stop. Otherwise schedule the next poll after `pollIntervalMs`.
+   */
+  private async pollForReady(): Promise<void> {
+    if (this.settled) return;
+
+    try {
+      console.log("[preview:poll] polling...");
+      const result = await this.opts.poll();
+      if (this.settled) return;
+
+      if (result.error) {
+        console.warn("[preview:poll] error (will retry):", result.error.message);
+      } else {
+        const data = result.data;
+        console.log("[preview:poll] status=%s previewUrl=%s", data?.status, data?.previewUrl ?? "(none)");
+        if (data?.status === "ready" && data.previewUrl) {
+          console.log("[preview:poll] detected ready");
+          this.emitReady(data.previewUrl);
+          return;
+        }
+        if (data?.status === "error") {
+          this.emitError(data.message ?? "Sandbox initialization failed");
+          return;
+        }
+      }
+    } catch (err) {
+      console.warn(
+        "[preview:poll] fetch failed (will retry):",
+        err instanceof Error ? err.message : err,
+      );
+    }
+
+    // Schedule next poll
+    console.log("[preview:poll] next poll in %dms", this.opts.pollIntervalMs);
+    this.pollIntervalTimer = setTimeout(() => {
+      if (!this.settled) this.pollForReady();
+    }, this.opts.pollIntervalMs);
   }
 
   // -----------------------------------------------------------------------
@@ -339,92 +478,14 @@ export class SandboxPreview {
 
   /**
    * Hard deadline. If no terminal state (ready/error) is reached within
-   * `maxWaitMs`, emit an error and stop everything. Prevents indefinite
-   * polling when the sandbox is truly stuck.
+   * `maxWaitMs`, emit an error and stop everything.
    */
   private scheduleDeadline(): void {
+    console.log("[preview] deadline set: %dms", this.opts.maxWaitMs);
     this.deadlineTimer = setTimeout(() => {
       if (this.settled) return;
+      console.error("[preview] DEADLINE exceeded (%dms)", this.opts.maxWaitMs);
       this.emitError("Sandbox initialization timed out");
     }, this.opts.maxWaitMs);
-  }
-
-  // -----------------------------------------------------------------------
-  // Internal — polling fallback
-  // -----------------------------------------------------------------------
-
-  /**
-   * Schedule the polling fallback. Two scenarios:
-   *
-   * 1. WS is completely silent → poll starts after `pollFallbackDelay`
-   * 2. WS delivers progress but never a terminal state → poll starts
-   *    after `pollFallbackDelay` from the last WS message
-   *
-   * In both cases, polling catches the terminal state that WS may
-   * fail to deliver due to waitUntil I/O isolation in workerd.
-   */
-  private schedulePollFallback(): void {
-    this.pollFallbackTimer = setTimeout(() => {
-      if (this.settled) return;
-
-      if (this.wsHasDelivered) {
-        // WS is alive but hasn't settled — schedule another check.
-        // Once WS goes quiet for pollFallbackDelay, polling kicks in.
-        const silentMs = Date.now() - this.lastWsProgressAt;
-        if (silentMs < this.opts.pollFallbackDelay) {
-          // WS was recently active — re-check after remaining grace period
-          this.pollFallbackTimer = setTimeout(() => {
-            if (!this.settled) {
-              console.warn(
-                "SandboxPreview: WS delivered progress but stalled — starting poll fallback",
-              );
-              this.startPolling();
-            }
-          }, this.opts.pollFallbackDelay - silentMs);
-          return;
-        }
-        // WS has been silent long enough — start polling
-        console.warn(
-          "SandboxPreview: WS delivered progress but stalled — starting poll fallback",
-        );
-      } else {
-        console.warn(
-          "SandboxPreview: WebSocket silent after timeout — starting poll fallback",
-        );
-      }
-      this.startPolling();
-    }, this.opts.pollFallbackDelay);
-  }
-
-  /**
-   * Poll the server to check for ready/error state. Does NOT self-cancel
-   * when WS delivers progress — only stops when a terminal state is reached.
-   */
-  private startPolling(): void {
-    if (this.pollTimer) return; // guard against duplicate timers
-    this.pollTimer = setInterval(async () => {
-      if (this.settled) {
-        if (this.pollTimer) {
-          clearInterval(this.pollTimer);
-          this.pollTimer = null;
-        }
-        return;
-      }
-      try {
-        const result = await this.opts.poll();
-        if (result.error) return;
-
-        const data = result.data;
-        if (!data) return;
-
-        if (data.status === "ready" && data.previewUrl) {
-          this.emitReady(data.previewUrl);
-        } else if (data.status === "error") {
-          this.emitError(data.message ?? "Sandbox initialization failed");
-        }
-      } catch {
-        // Swallow poll errors — this is a fallback, not critical path
-      }
-    }, this.opts.pollInterval);
   }
 }

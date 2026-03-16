@@ -1,13 +1,13 @@
 /**
  * App-specific sandbox configuration.
  *
- * The Docker image (sandbox/Dockerfile) ships with a complete Vue + Vite
- * app pre-installed at /workspace/app — package.json, vite.config.ts,
- * index.html, main.ts, and node_modules are all baked in.
+ * The Docker image (sandbox/Dockerfile) ships with a complete Slidev
+ * app pre-installed at /workspace/app — package.json, .npmrc,
+ * vite.config.ts, slides.md, and node_modules are all baked in.
  *
  * At runtime we only need to:
- *   1. Write App.vue (the editable file)
- *   2. Start the Vite dev server
+ *   1. Write slides.md (the editable file)
+ *   2. Start the Slidev dev server
  *   3. Wait for it to respond
  *
  * This keeps container startup fast with zero network dependency.
@@ -15,107 +15,119 @@
 
 import { SandboxManager } from "./sandbox-manager";
 
-/** The directory inside the container where the Vue app lives. */
+/** The directory inside the container where the Slidev app lives. */
 const APP_DIR = "/workspace/app";
 
+/**
+ * Sub-path for the sandbox Vite app. Namespaces all sandbox assets to
+ * avoid route collisions with the host Astro app.
+ * Matches the official sandbox-sdk vite-sandbox example pattern.
+ */
+const VITE_BASE = "/_/";
+
 /** The file shown in the editor pane. */
-export const EDITABLE_FILE = `${APP_DIR}/src/App.vue`;
+export const EDITABLE_FILE = `${APP_DIR}/slides.md`;
 
-/** Default content for App.vue (matches sandbox/app/src/App.vue). */
-const DEFAULT_APP_VUE = `<script setup lang="ts">
-import { ref } from "vue";
+/** Default content for slides.md (matches sandbox/app/slides.md). */
+const DEFAULT_SLIDES_MD = `---
+theme: default
+---
 
-const count = ref(0);
-</script>
+# Welcome to Slidev
 
-<template>
-  <div style="font-family: sans-serif; max-width: 600px; margin: 40px auto; text-align: center;">
-    <h1>Hello from the Sandbox!</h1>
-    <p>Edit this component in the editor and save to see HMR in action.</p>
-    <button @click="count++" style="font-size: 1.2rem; padding: 8px 20px; cursor: pointer;">
-      Count: {{ count }}
-    </button>
-  </div>
-</template>
+Presentation slides for developers
+
+---
+
+# Slide 2
+
+- Edit this file in the editor
+- Save to see live updates
+- Add slides with \`---\` separator
+
+---
+
+# Code Example
+
+\`\`\`ts
+console.log('Hello, Slidev!')
+\`\`\`
+
+---
+
+# Learn More
+
+[Slidev Documentation](https://sli.dev)
 `;
 
 export const sandboxManager = new SandboxManager({
   port: 3001,
-  token: "vuehmr",
-  portName: "vite-dev",
+  token: "slidev",
+  portName: "slidev-dev",
   sleepAfter: "5m",
+  basePath: VITE_BASE,
 
-  async initialize({ sandbox, progress }) {
+  async initialize({ sandbox, progress, host }) {
     // Write the editable file (image ships a copy, but we write it fresh
     // so the content always matches what the editor will show).
     progress("writing_files");
-    await sandbox.writeFile(EDITABLE_FILE, DEFAULT_APP_VUE);
+    await sandbox.writeFile(EDITABLE_FILE, DEFAULT_SLIDES_MD);
 
-    // Start the Vite dev server
+    // Derive the HMR client port from the host. In production this is
+    // 443 (standard HTTPS). In local dev it's the Vite dev server port.
+    const hostPort = host.includes(":") ? host.split(":")[1] : "443";
+
+    // Start the Slidev dev server.
+    // - Use ./node_modules/.bin/slidev (not npx) because npx has unreliable
+    //   resolution for @slidev/cli's "slidev" binary.
+    // - Pass slides.md as explicit entry argument.
+    // - Use --remote to enable public host binding (--bind defaults to 0.0.0.0).
+    // - Pipe stdin from `tail -f /dev/null` to keep the process alive. Slidev's
+    //   CLI listens on stdin for keyboard shortcuts and exits immediately when
+    //   stdin closes (which happens in non-TTY environments like sandbox).
     progress("starting_server");
-    await sandbox.startProcess("npx vite --port 3001", {
-      processId: "vite-dev",
-      cwd: APP_DIR,
-      env: {
-        PORT: "3001",
-        NODE_ENV: "development",
-        // Ensure chokidar uses polling (env var fallback in case
-        // the vite.config.ts watch option isn't respected).
-        CHOKIDAR_USEPOLLING: "true",
-        CHOKIDAR_INTERVAL: "500",
+    const proc = await sandbox.startProcess(
+      "tail -f /dev/null | ./node_modules/.bin/slidev slides.md --port 3001 --remote --base " + VITE_BASE,
+      {
+        processId: "slidev-dev",
+        cwd: APP_DIR,
+        env: {
+          PORT: "3001",
+          NODE_ENV: "development",
+          VITE_BASE: VITE_BASE,
+          VITE_HMR_CLIENT_PORT: hostPort,
+          // Chokidar polling is needed for reliable filesystem change
+          // detection inside the container (for Vite HMR).
+          CHOKIDAR_USEPOLLING: "true",
+          CHOKIDAR_INTERVAL: "500",
+        },
       },
-    });
+    );
 
-    // Give the process a moment to either crash or start listening
-    await new Promise((resolve) => setTimeout(resolve, 2000));
-
-    // Bail early if the process already exited
-    const procStatus = await sandbox.getProcess("vite-dev");
-    if (
-      procStatus &&
-      (procStatus.status === "completed" ||
-        procStatus.status === "failed" ||
-        procStatus.status === "killed" ||
-        procStatus.status === "error")
-    ) {
-      const procLogs = await procStatus.getLogs();
-      throw new Error(
-        `vite dev exited immediately (exit ${procStatus.exitCode}): ${procLogs.stderr?.slice(0, 500) ?? procLogs.stdout?.slice(0, 500) ?? "no output"}`,
-      );
-    }
-
-    // Poll until the server responds
+    // Use the SDK's waitForPort() — it polls internally using an efficient
+    // mechanism and resolves as soon as port 3001 responds with HTTP 2xx/3xx.
+    // This replaces our manual curl loop and is significantly faster.
     progress("waiting_for_ready");
-    let isReady = false;
-    for (let i = 0; i < 15; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 3000));
-
-      // Check if the process crashed mid-loop
-      const liveProc = await sandbox.getProcess("vite-dev");
-      if (
-        liveProc &&
-        (liveProc.status === "completed" ||
-          liveProc.status === "failed" ||
-          liveProc.status === "killed" ||
-          liveProc.status === "error")
-      ) {
-        const crashLogs = await liveProc.getLogs();
-        throw new Error(
-          `vite dev crashed (exit ${liveProc.exitCode}): ${crashLogs.stderr?.slice(0, 500) ?? crashLogs.stdout?.slice(0, 500) ?? "no output"}`,
-        );
-      }
-
-      const health = await sandbox.exec(
-        'curl -s -o /dev/null -w "%{http_code}" http://localhost:3001/ || echo "000"',
+    const waitStart = Date.now();
+    try {
+      await proc.waitForPort(3001, {
+        mode: "http",
+        path: VITE_BASE,
+        status: { min: 200, max: 399 },
+      });
+      console.log(`[sandbox-init] waitForPort resolved in ${Date.now() - waitStart}ms`);
+    } catch (err) {
+      // If waitForPort fails, grab logs for diagnostics
+      const logs = await proc.getLogs();
+      const logOutput = [
+        logs.stdout ? `stdout: ${logs.stdout.slice(0, 500)}` : "",
+        logs.stderr ? `stderr: ${logs.stderr.slice(0, 500)}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n") || "no output";
+      throw new Error(
+        `Slidev server failed to start: ${err instanceof Error ? err.message : "unknown error"}\n${logOutput}`,
       );
-      if (health.stdout.startsWith("2") || health.stdout.startsWith("3")) {
-        isReady = true;
-        break;
-      }
-    }
-
-    if (!isReady) {
-      throw new Error("Server failed to respond within timeout");
     }
 
     // Port exposure is handled by the manager after this returns.

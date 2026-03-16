@@ -14,13 +14,20 @@
   "observability": {
     "enabled": true,
   },
+  // Ensure all requests pass through the worker (not served as static
+  // assets first). This is required so proxyToSandbox() gets a chance
+  // to intercept sandbox preview URL requests before asset handling.
+  // See: cloudflare/sandbox-sdk examples/vite-sandbox
+  "assets": {
+    "not_found_handling": "none",
+  },
   // Container config at top level so local dev can access it
   "containers": [
     {
       "name": "sandbox",
       "class_name": "Sandbox",
       "image": "./sandbox/Dockerfile",
-      "instance_type": "basic",
+      "instance_type": "standard-2",
       "max_instances": 5,
     },
   ],
